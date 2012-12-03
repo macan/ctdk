@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-11-30 15:14:27 macan>
+ * Time-stamp: <2012-12-03 14:47:18 macan>
  *
  */
 
@@ -67,12 +67,12 @@ struct streamid
 #define STREAM_OUT              0x02
 #define STREAM_INNIL            0x04
 #define STREAM_OUTNIL           0x08
-    unsigned int direction:4;   /* IN: 0; OUT: 1
-                                 * INNIL: 2; OUTNIL 3
+    unsigned int direction:4;   /* IN: 1; OUT: 2
+                                 * INNIL: 4; OUTNIL 8
                                  */
-#define STREAM_TCP              0
-#define STREAM_UDP              1
-    unsigned int protocol:28;   /* TCP: 0; UDA: 1 */
+#define STREAM_TCP              1
+#define STREAM_UDP              2
+    unsigned int protocol:28;   /* TCP: 1; UDA: 2 */
 
     unsigned long jlsj;         /* recored time */
     unsigned long jcsj;         /* detect time */
@@ -88,9 +88,9 @@ struct huadan
     unsigned int fwqdk;         /* server port */
     unsigned int khdip;         /* client ip */
     unsigned int khddk;         /* client port */
-#define STREAM_TCP              0
-#define STREAM_UDP              1
-    unsigned int protocol;      /* TCP: 0; UDA: 1 */
+#define STREAM_TCP              1
+#define STREAM_UDP              2
+    unsigned int protocol;      /* TCP: 1; UDA: 2 */
 
     unsigned int gjlx;          /* tool type */
     unsigned long qssj;         /* begin time */
@@ -122,6 +122,11 @@ struct streamstat
     unsigned long ojcks;
     unsigned long ozjs;
     unsigned int obs;
+};
+
+struct stream_config
+{
+    int ignoreact;
 };
 
 /* Database Name */

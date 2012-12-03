@@ -3,7 +3,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-11-30 16:11:28 macan>
+# Time-stamp: <2012-12-03 15:04:41 macan>
 #
 # This is the mangement script for Pomegranate
 #
@@ -135,7 +135,7 @@ function start_client() {
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
             port=`echo $x | awk -F: '{print $3}'`
-            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5|'`
+            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5'$HVFS_HOME'\6|'`
             $SSH $UN$ip "$RC_CMD $HVFS_HOME/ctdk_huadan_1d $id > $LOG_DIR/client.$id.log" > /dev/null &
         done
         echo "Start clients done."
@@ -145,7 +145,7 @@ function start_client() {
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
             port=`echo $x | awk -F: '{print $3}'`
-            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5|'`
+            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5'$HOME'\6|'`
             $SSH $UN$ip "$RC_CMD $HVFS_HOME/ctdk_huadan_1d $id > $LOG_DIR/client.$id.log" > /dev/null &
             echo "Start client $id done."
         done

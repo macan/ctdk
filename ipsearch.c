@@ -6,6 +6,8 @@
 #include <string.h> 
 #include <iconv.h>
  
+static unsigned long index_start, index_end = 0;
+
 typedef struct ip_info { 
     char ip[16]; 
     char *country;     //国家 
@@ -141,12 +143,19 @@ char* get_area(unsigned char* buffer, FILE *fp)//获取区域信息
 
 unsigned long search_ip(char *ip_in, FILE *fp)//查找索引区，获取所在区域首地址 
 { 
-    unsigned long index_start, index_end, lo, hi, i, ip_i, ip_dest; 
-    unsigned char ip_arr[4]; 
+    unsigned long lo, hi, i, ip_i, ip_dest; 
+    unsigned char ip_arr[4];
+    int err = 0;
     
-    fseek(fp, 0, SEEK_SET);   //SEEK_SET=0 
-    fread(&index_start, 4, 1, fp); 
-    fread(&index_end, 4, 1, fp); 
+    if (index_end == 0) {
+        err = fseek(fp, 0, SEEK_SET);   //SEEK_SET=0
+        if (err) {
+            perror("fseek");
+        }
+        err = fread(&index_start, 4, 1, fp);
+        err = fread(&index_end, 4, 1, fp); 
+    }
+    
     lo = 0; 
     hi = (index_end - index_start) / 7; //索引数 
     ip_dest = ip_str2dec(ip_in); 
@@ -157,9 +166,9 @@ unsigned long search_ip(char *ip_in, FILE *fp)//查找索引区，获取所在�
         fseek(fp, index_start + i * 7, SEEK_SET); 
         fread(ip_arr, 4, 1, fp); 
         ip_i = ip_arr2dec_r(ip_arr); 
-        if (ip_i == ip_dest) 
+        if (ip_i == ip_dest) {
             return index_start + i * 7;//在索引表中找到匹配地址就返回地址（在整个文件中的位置） 有问题,有可能找不到 
-        else if (ip_i < ip_dest) { 
+        } else if (ip_i < ip_dest) { 
             lo = i + 1; 
             if(lo>=hi) {
                 return index_start + (i+1) * 7; 
@@ -194,7 +203,33 @@ int g2u(char *inbuf,size_t inlen,char *outbuf,size_t outlen)
 {
     return code_convert("gbk", "utf-8", inbuf, inlen, outbuf, outlen);
 }
- 
+
+void ipconv(char *ip, char *address, FILE *fp)
+{
+    unsigned long ipaddr;
+
+    if (!fp) {
+        sprintf(address, "Null");
+        return;
+    }
+
+    ipaddr = search_ip(ip, fp);
+    if (!ipaddr) {
+        sprintf(address, "None");
+        return;
+    }
+    
+    IP_INFO *ipinfo = get_ip_by_index(ipaddr, fp);
+    char out1[100], out2[100];
+
+    g2u(ipinfo->country, strlen(ipinfo->country), out1, 100);
+    g2u(ipinfo->area, strlen(ipinfo->area), out2, 100);
+    sprintf(address,"%s/%s", out1, out2);
+
+    free(ipinfo);
+}
+
+#ifndef NO_LINK
 int main(int argc, char* argv[]) 
 { 
     FILE *fp; 
@@ -202,7 +237,7 @@ int main(int argc, char* argv[])
     if(fp==NULL) printf("不能打开QQWry.Dat!\n"); 
 
     //char *ip = "159.226.41.88";
-    char *ip = "202.113.16.117";
+    char *ip = "202.108.33.74";
     //char *ip = "159.226.251.13";
     if (argc > 1) {
         ip = argv[1];
@@ -216,7 +251,12 @@ int main(int argc, char* argv[])
     g2u(ipinfo->country, strlen(ipinfo->country), out1, 100);
     g2u(ipinfo->area, strlen(ipinfo->area), out2, 100);
     sprintf(address,"%s/%s\n",out1, out2); 
-    printf("ip:%s => address:%s\n", ip, address); 
+    printf("ip:%s %lx => address:%s\n", ip, ipaddress, address);
+
+    char buf[1024];
+    
+    ipconv(ip, buf, fp);
+    printf("ip:%s => address:%s\n", ip, buf);
     
     free(ipinfo); 
     
@@ -224,3 +264,4 @@ int main(int argc, char* argv[])
 
     return 0; 
 }
+#endif
