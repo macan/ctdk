@@ -3,7 +3,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-12-03 15:04:41 macan>
+# Time-stamp: <2012-12-04 15:38:42 macan>
 #
 # This is the mangement script for Pomegranate
 #
@@ -44,6 +44,7 @@ export STORE_DIR
 if [ "x$PASSWD" == "x" ]; then
     # it is the normal mode, we do not use expect
     SSH="ssh -x"
+    SCP="scp"
 else
     # we have to use expect to login
     SSH="$HVFS_HOME/bin/rexec.exp $PASSWD"
@@ -109,6 +110,7 @@ function gen_config() {
         id=$1
         port=$2
     fi
+    IP=$3
 
     if [ -e $HVFS_HOME/conf/redis.conf ]; then
         cat $HVFS_HOME/conf/redis.conf | \
@@ -116,11 +118,12 @@ function gen_config() {
             -e 's|^port \(.*\)|port '$port'|' \
             -e 's|^dbfilename \(.*\)|dbfilename '$STORE_DIR'/server.'$id'.rdb|' \
             > $HVFS_HOME/conf/redis.$id.$port.conf
+        $SCP $HVFS_HOME/conf/redis.$id.$port.conf $UN$IP:$HVFS_HOME/conf/
     fi
 }
 
 function adjust_syn() {
-    ipnr=`cat $CONFIG_FILE | grep "redis:" | awk -F: '{print $2":"$4":"$3}'`
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
     for x in $ipnr; do
         ip=`echo $x | awk -F: '{print $1}'`
         $SSH $UN$ip "$SYSCTL_ADJ_SYN" > /dev/null &
@@ -130,7 +133,7 @@ function adjust_syn() {
 
 function start_client() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "client:" | awk -F: '{print $2":"$4":"$3}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:" | awk -F: '{print $2":"$4":"$3}'`
         for x in $ipnr; do 
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
@@ -140,7 +143,7 @@ function start_client() {
         done
         echo "Start clients done."
     else
-        ipnr=`cat $CONFIG_FILE | grep "client:.*:$1\$" | awk -F: '{print $2":"$4":"$3}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:.*:$1\$" | awk -F: '{print $2":"$4":"$3}'`
         for x in $ipnr; do 
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
@@ -154,18 +157,18 @@ function start_client() {
 
 function start_server() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "redis:" | awk -F: '{print $2":"$4":"$3}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
         for x in $ipnr; do 
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
             port=`echo $x | awk -F: '{print $3}'`
-            gen_config $id $port
+            gen_config $id $port $ip
             $SSH $UN$ip "$RS_CMD $HVFS_HOME/bin/redis-server $HVFS_HOME/conf/redis.$id.$port.conf > $LOG_DIR/server.$id.log" > /dev/null &
             #unlink $HVFS_HOME/conf/redis.$id.$port.conf
         done
         echo "Start Redis server done."
     else
-        ipnr=`cat $CONFIG_FILE | grep "redis:.*:$1\$" | awk -F: '{print $2":"$4":"$3}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:.*:$1\$" | awk -F: '{print $2":"$4":"$3}'`
         for x in $ipnr; do 
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
@@ -180,9 +183,9 @@ function start_server() {
 
 function stop_client() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "client:" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:" | awk -F: '{print $2":"$4}'`
     else
-        ipnr=`cat $CONFIG_FILE | grep "client:.*:$1\$" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:.*:$1\$" | awk -F: '{print $2":"$4}'`
     fi
 
     for x in $ipnr; do 
@@ -196,9 +199,9 @@ function stop_client() {
 
 function stop_server() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "redis:" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4}'`
     else
-        ipnr=`cat $CONFIG_FILE | grep "redis:.*:$1\$" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:.*:$1\$" | awk -F: '{print $2":"$4}'`
     fi
 
     for x in $ipnr; do 
@@ -212,9 +215,9 @@ function stop_server() {
 
 function kill_client() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "client:" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:" | awk -F: '{print $2":"$4}'`
     else
-        ipnr=`cat $CONFIG_FILE | grep "client:.*:$1\$" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^client:.*:$1\$" | awk -F: '{print $2":"$4}'`
     fi
 
     for x in $ipnr; do 
@@ -228,9 +231,9 @@ function kill_client() {
 
 function kill_server() {
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "redis:" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4}'`
     else
-        ipnr=`cat $CONFIG_FILE | grep "redis:.*:$1\$" | awk -F: '{print $2":"$4}'`
+        ipnr=`cat $CONFIG_FILE | grep "^redis:.*:$1\$" | awk -F: '{print $2":"$4}'`
     fi
 
     for x in $ipnr; do 
@@ -244,7 +247,7 @@ function kill_server() {
 
 function start_all() {
     start_server
-    start_client
+    #start_client
 }
 
 function stop_all() {
@@ -257,13 +260,9 @@ function kill_all() {
     kill_server
 }
 
-function do_clean() {
-    echo "Do clean now ..."
-}
-
 function stat_client() {
     echo "----------CLIENT-----------"
-    ipnr=`cat $CONFIG_FILE | grep "client:" | awk -F: '{print $2":"$4}'`
+    ipnr=`cat $CONFIG_FILE | grep "^client:" | awk -F: '{print $2":"$4}'`
     for x in $ipnr; do 
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
@@ -278,7 +277,7 @@ function stat_client() {
 
 function stat_server() {
     echo "----------SERVER-----------"
-    ipnr=`cat $CONFIG_FILE | grep "redis:" | awk -F: '{print $2":"$4}'`
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4}'`
     for x in $ipnr; do 
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
@@ -295,6 +294,35 @@ function do_status() {
     echo "Checking clusters' status ..."
     stat_server
     stat_client
+}
+
+function do_size() {
+    echo "Calculate DBSize now ..."
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
+    TNR=0
+    for x in $ipnr; do 
+        ip=`echo $x | awk -F: '{print $1}'`
+        id=`echo $x | awk -F: '{print $2}'`
+        port=`echo $x | awk -F: '{print $3}'`
+        NR=`echo DBSIZE | $HVFS_HOME/bin/redis-cli -h $ip -p $port | cut -f2`
+        let TNR=$TNR+$NR
+        echo "Server $id dbsize $NR"
+    done
+    echo "Total dbsize $TNR"
+}
+
+function do_clean() {
+    echo "Flush Database Now ..."
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
+    TNR=0
+    for x in $ipnr; do 
+        ip=`echo $x | awk -F: '{print $1}'`
+        id=`echo $x | awk -F: '{print $2}'`
+        port=`echo $x | awk -F: '{print $3}'`
+        echo -n "Server $id "
+        echo FLUSHALL | $HVFS_HOME/bin/redis-cli -h $ip -p $port | cut -f2
+    done
+    echo "All Clear!"
 }
 
 function do_help() {
@@ -353,6 +381,10 @@ elif [ "x$1" == "xkill" ]; then
 elif [ "x$1" == "xstat" ]; then
     if [ "x$2" == "x" ]; then
         do_status
+    fi
+elif [ "x$1" == "xsize" ]; then
+    if [ "x$2" == "x" ]; then
+        do_size
     fi
 elif [ "x$1" == "xclean" ]; then
     do_clean

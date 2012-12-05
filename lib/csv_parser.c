@@ -129,3 +129,29 @@ int csv_parse(FILE *fp, CSV_CB_record_handler cb, void *params)
 	}
 	return 0;
 }
+
+int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
+{
+	//char buff[MAX_LINE_LEN];
+	struct csv_parser_data d;
+	
+	d.callback = cb;
+	d.params   = params;
+
+	while ( d.buff[MAX_LINE_LEN-1]='*',
+			NULL!= fgets (d.buff, MAX_LINE_LEN, fp) ) {
+		int r;
+
+        /* remove tailing $EOF$ */
+        if ((r = strlen(d.buff)) >= 5)
+            d.buff[r - 5] = '\0';
+		if(d.buff[MAX_LINE_LEN-1]=='\0' && d.buff[MAX_LINE_LEN-2]!='\n')
+			return E_LINE_TOO_WIDE;
+		if (E_QUOTED_STRING==(r=csv_parse_line (&d) ) )
+			return E_QUOTED_STRING;
+		else if (r!=0)
+			break;
+	}
+	return 0;
+}
+

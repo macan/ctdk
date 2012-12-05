@@ -4,6 +4,7 @@
 #define _CSV_PARSER_H_
 
 #include <stdio.h>  // for fopen, fclose, etc.
+#include <string.h> // for strlen
 
 
 #define MAX_LINE_LEN (1024*512)

@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-03 14:47:18 macan>
+ * Time-stamp: <2012-12-05 09:41:12 macan>
  *
  */
 
@@ -122,6 +122,21 @@ struct streamstat
     unsigned long ojcks;
     unsigned long ozjs;
     unsigned int obs;
+};
+
+struct ARecord
+{
+    unsigned int ip;
+    unsigned int port;
+    unsigned int gjlx;
+    unsigned int rzlx;
+    unsigned long sxsj;         /* effective time [-20,20] */
+};
+
+struct BRecord
+{
+    unsigned int ip;
+    unsigned long sxsj;         /* effective time [0,20] */
 };
 
 struct stream_config
