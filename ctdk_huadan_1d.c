@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-04 17:22:04 macan>
+ * Time-stamp: <2012-12-11 14:19:49 macan>
  *
  */
 
@@ -20,22 +20,40 @@ struct manager
 
 struct chring server_ring;
 struct xnet_group *xg = NULL;
+struct xnet_group *xg_client = NULL;
 struct manager m;
 int huadan_fd = 1;
 FILE *dbfp = NULL;
+FILE *g_dfp = NULL;
+long g_doffset = 0;
+
 #define HUADAN_FSYNC_NR         1000
 long pop_huadan_nr = 0;
 long peek_huadan_nr = 0;
 long process_nr = 0;
+long corrupt_nr = 0;
 long ignore_nr = 0;
 long poped = 0;
 long flushed = 0;
 int g_id = -1;
-int g_flush = 0;
+int g_round = -1;
+int g_local = 0;
+#define ACTION_NOOP             0x00
+#define ACTION_LOAD_DATA        0x01
+#define ACTION_PEEK_HUADAN      0x02
+#define ACTION_POP_HUADAN       0x04
+#define ACTION_TEST             0x80
+int g_action = 0;
+int g_client_nr = 0;
 
 static struct stream_config g_sc = {
     .ignoreact = 1,
 };
+
+/* for getStreamStat() use */
+#define DO_PEEK         0
+#define DO_POP_RENAME   1
+#define DO_POP_ONLY     2
 
 #define GEN_HASH_KEY(key, id) do {                          \
         snprintf(key, 127, "S:%u:%u:%u:%u:%u",              \
@@ -112,7 +130,7 @@ char *printHuadan(struct huadan *hd)
         hvfs_err(lib, "malloc() str buffer failed\n");
         return NULL;
     }
-    tmp1 = localtime(&hd->qssj);
+    tmp1 = localtime((time_t *)&hd->qssj);
     if (!tmp1) {
         hvfs_err(lib, "localtime() failed w/ %s\n", strerror(errno));
         goto free;
@@ -121,7 +139,7 @@ char *printHuadan(struct huadan *hd)
         hvfs_err(lib, "strftime() failed w/ %s\n", strerror(errno));
         goto free;
     }
-    tmp2 = localtime(&hd->jssj);
+    tmp2 = localtime((time_t *)&hd->jssj);
     if (!tmp2) {
         hvfs_err(lib, "localtime() failed w/ %s\n", strerror(errno));
         goto free;
@@ -197,51 +215,6 @@ redisContext *get_server_from_key(char *key)
     return e->context;
 }
 
-int selectNextDB(redisContext *c, int current)
-{
-    redisReply *reply;
-    int nextDB = DB_STREAM_BACKUP;
-    int err = 0;
-
-    if (current == DB_HUADAN)
-        return -1;
-    if (current >= DB_STREAM_BACKUP)
-        nextDB = current + 1;
-    if (nextDB > DB_STREAM_BACKUP_MAX) {
-        hvfs_err(lib, "select new DB %d exceed max valid DBs(16).\n", current);
-        return -1;
-    }
-    reply = redisCommand(c, "SELECT %d", nextDB);
-    if (reply->type == REDIS_REPLY_STRING) {
-        if (strncmp(reply->str, "+OK", 3) != 0) {
-            err = -1;
-            goto out;
-        }
-    }
-out:
-    return err;
-}
-
-int selectDB(redisContext *c, int db)
-{
-    redisReply *reply;
-    int err = 0;
-
-    if (db > DB_STREAM_BACKUP_MAX) {
-        hvfs_err(lib, "select new DB %d exceed max valid DBs(16).\n", db);
-        return -1;
-    }
-    reply = redisCommand(c, "SELECT %d", db);
-    if (reply->type == REDIS_REPLY_STRING) {
-        if (strncmp(reply->str, "+OK", 3) != 0) {
-            err = -1;
-            goto out;
-        }
-    }
-out:
-    return err;
-}
-
 int new_stream(struct streamid *id, int suffix);
 
 /* Return value: 0 => OK and updated; -1 => Internal Err; 1 => not updated
@@ -251,7 +224,6 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     char key[128];
     redisContext *c;
     redisReply *reply = NULL;
-    int err = 0;
 
 #define STREAM_HEAD     "HUPDBY %s DON %d "
 #define INB_STREAM      STREAM_HEAD "izjs %d igjlx %d ijlsj %ld ijcsj %ld icljip %d ibs %d"
@@ -295,10 +267,8 @@ int addOrUpdateStream(struct streamid *id, int suffix)
         /* the update flag */
         switch (reply->integer) {
         case CANCEL:
-        {
             hvfs_debug(lib, "CANCEL record\n");
             break;
-        }
         case INB_INIT:
         case OUT_INIT:
             hvfs_debug(lib, "INIT STREAM\n");
@@ -314,11 +284,12 @@ int addOrUpdateStream(struct streamid *id, int suffix)
         case ALL_CLOSED:
             hvfs_debug(lib, "FULLY CLOSE STREAM\n");
             poped++;
-            pop_huadan(id, suffix);
+            pop_huadan(id, suffix, DO_POP_RENAME);
             break;
         case INB_IGNORE:
         case OUT_IGNORE:
             hvfs_debug(lib, "IGNORE record\n");
+            new_stream(id, suffix);
             break;
         case TIMED_IGNORE:
             /* new stream? */
@@ -331,7 +302,7 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     }
     freeReplyObject(reply);
 
-    return err;
+    return 0;
 }
 
 int new_stream(struct streamid *id, int suffix)
@@ -369,6 +340,8 @@ int rename_stream(struct streamid *id, int suffix)
     reply = redisCommand(c, "RENAME %s %s", from_key, to_key);
     if (reply->type == REDIS_REPLY_ERROR) {
         /* ok, we can safely stop here */
+        hvfs_debug(lib, "RENAME from %s to %s failed %s\n", 
+                   from_key, to_key, reply->str);
         freeReplyObject(reply);
         return 0;
     } else {
@@ -378,15 +351,13 @@ int rename_stream(struct streamid *id, int suffix)
     }
 }
 
-/* pop: 0 => peek, 1 => pop
+/* pop: 0 => peek, 1 => pop and rename, 2 => pop and not rename
  */
 int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int pop)
 {
     char key[128];
     redisContext *c;
     redisReply *reply;
-    unsigned long begin, end;
-    int err = 0;
 
     memset(stat, 0, sizeof(*stat));
 
@@ -456,7 +427,7 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
     }
 
     /* try to rename same five tuple streams */
-    if (pop && !g_flush)
+    if (pop == DO_POP_RENAME)
         rename_stream(id, suffix);
 
     return 0;
@@ -464,7 +435,7 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
 
 void generate_huadan(struct streamid *id, struct streamstat *stat, struct huadan *hd)
 {
-    unsigned long begin, end;
+    long long begin, end;
 
     if (!id || !stat || !hd)
         return;
@@ -498,6 +469,11 @@ void generate_huadan(struct streamid *id, struct streamstat *stat, struct huadan
         end = max(stat->ijcsj, stat->ojcsj);
         
         hd->cxsj = end - begin + 1;
+        if (end - begin + 1 < 0) {
+            char *str = printStreamStat(id, stat);
+            hvfs_warning(lib, "Detect minus CXSJ: %s\n", str);
+            free(str);
+        }
     } else {
         /* no NIL packet, based on jlsj */
         hd->cxsj = hd->jssj - hd->qssj + 1;
@@ -509,7 +485,7 @@ void generate_huadan(struct streamid *id, struct streamstat *stat, struct huadan
     hd->out_zjs = stat->ozjs;
 }
 
-int pop_huadan(struct streamid *id, int suffix)
+int pop_huadan(struct streamid *id, int suffix, int flag)
 {
     struct streamstat stat;
     struct huadan hd;
@@ -519,7 +495,7 @@ int pop_huadan(struct streamid *id, int suffix)
     memset(&stat, 0, sizeof(stat));
     memset(&hd, 0, sizeof(hd));
     
-    err = getStreamStat(id, suffix, &stat, 1);
+    err = getStreamStat(id, suffix, &stat, flag);
     if (err)
         return err;
 
@@ -561,7 +537,7 @@ int peek_huadan(struct streamid *id, int suffix)
     memset(&stat, 0, sizeof(stat));
     memset(&hd, 0, sizeof(hd));
     
-    err = getStreamStat(id, suffix, &stat, 0);
+    err = getStreamStat(id, suffix, &stat, DO_PEEK);
     if (err)
         return err;
 
@@ -624,6 +600,120 @@ int parse_streamid(char *ID, struct streamid *id)
     return suffix;
 }
 
+int mark_end_self()
+{
+    redisContext *c;
+    redisReply *reply;
+    int nr = 0;
+
+    if (!xg)
+        return 0;
+
+    /* USE 0th server */
+    c = xg->sites[0].context;
+    
+    reply = redisCommand(c, "INCR POP_BARRIER-%d", g_round);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        nr = reply->integer;
+    } else {
+        hvfs_warning(lib, "Not an integer reply?\n");
+    }
+    freeReplyObject(reply);
+
+    return nr;
+}
+
+static inline int test_end()
+{
+    redisContext *c;
+    redisReply *reply;
+    int nr = 0, i;
+
+    if (!xg)
+        return 0;
+
+    /* USE 0th server */
+    c = xg->sites[0].context;
+
+    if (g_round > 0) {
+        for (i = 0; i < g_round; i++) {
+            reply = redisCommand(c, "GET POP_BARRIER-%d", i);
+            if (reply->type == REDIS_REPLY_STRING) {
+                nr = atoi(reply->str);
+            } else {
+                hvfs_warning(lib, "Not an integer string reply? %s\n", reply->str);
+            }
+            freeReplyObject(reply);
+        }
+    } else {
+        reply = redisCommand(c, "GET POP_BARRIER-%d", g_round);
+        if (reply->type == REDIS_REPLY_STRING) {
+            nr = atoi(reply->str);
+        } else {
+            hvfs_warning(lib, "Not an integer string reply? %s\n", reply->str);
+        }
+        freeReplyObject(reply);
+    }
+
+    return nr;
+}
+
+static inline void clear_pop_barrier()
+{
+    redisContext *c;
+    redisReply *reply;
+
+    if (!xg)
+        return;
+
+    /* USE 0th server */
+    c = xg->sites[0].context;
+
+    if (g_round > 0) {
+        int i;
+
+        for (i = 0; i < g_round; i++) {
+            reply = redisCommand(c, "EXPIRE POP_BARRIER-%d 60", i);
+            if (reply->type == REDIS_REPLY_INTEGER) {
+                if (!reply->integer) {
+                    hvfs_warning(lib, "EXPIRE POP_BARRIER-%d failed, "
+                                 "please clean it yourself!\n", i);
+                }
+            } else {
+                hvfs_warning(lib, "Not an integer reply?\n");
+            }
+            freeReplyObject(reply);
+        }
+    } else {
+        /* clear default barrier */
+        reply = redisCommand(c, "EXPIRE POP_BARRIER-%d 60", g_round);
+        if (reply->type == REDIS_REPLY_INTEGER) {
+            if (!reply->integer) {
+                hvfs_warning(lib, "EXPIRE POP_BARRIER-%d failed, "
+                             "please clean it yourself!\n", g_round);
+            }
+        } else {
+            hvfs_warning(lib, "Not an integer reply?\n");
+        }
+        freeReplyObject(reply);
+    }
+
+    return;
+}
+
+void wait_for_all_end()
+{
+    int nr;
+    
+    do {
+        nr = test_end();
+        if (nr >= g_client_nr * g_round)
+            break;
+        sleep(1);
+    } while (0);
+    /* FIXME: !! */
+}
+
 void pop_stream(redisContext *c)
 {
     struct streamid id;
@@ -637,7 +727,8 @@ void pop_stream(redisContext *c)
         for (j = 0; j < reply->elements; j++) {
             suffix = parse_streamid(reply->element[j]->str, &id);
             flushed++;
-            err = pop_huadan(&id, suffix);
+            /* do not need rename streams */
+            err = pop_huadan(&id, suffix, DO_POP_ONLY);
             if (err) {
                 hvfs_err(lib, "pop_huadan() '%s' failed w/ %d\n",
                          reply->element[j]->str, err);
@@ -650,15 +741,196 @@ void pop_stream(redisContext *c)
 void pop_all_stream()
 {
     redisContext *c;
-    
     int i;
 
-    /* FIXME: send an inc to REDIS:0 */
-    g_flush = 1;
+    /* wait for other clients */
+    wait_for_all_end();
+    
+    /* only pop the streams on my own host */
+    if (g_local) {
+        /* get interface address */
+        struct ifaddrs *ifaddr, *ifa;
+        int family, s;
+        char host[NI_MAXHOST];
+
+        if (getifaddrs(&ifaddr) == -1) {
+            hvfs_err(lib, "getifaddrs() failed w/ %s\n", strerror(-errno));
+            return;
+        }
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL)
+                continue;
+
+            family = ifa->ifa_addr->sa_family;
+            if (family == AF_INET) {
+                s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                                host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                if (s != 0) {
+                    printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                    exit(EXIT_FAILURE);
+                }
+
+                for (i = 0; i < xg->asize; i++) {
+                    if (strcmp(host, xg->sites[i].node) == 0) {
+                        hvfs_info(lib, "POP local server[%d] %s:%d\n",
+                                  i, xg->sites[i].node, xg->sites[i].port);
+                        c = xg->sites[i].context;
+                        pop_stream(c);
+                    }
+                }
+            }
+        }
+    } else {
+        for (i = 0; i < xg->asize; i++) {
+            c = xg->sites[i].context;
+            pop_stream(c);
+        }
+    }
+}
+
+void peek_stream(redisContext *c)
+{
+    struct streamid id;
+    redisReply *reply;
+    int suffix, err;
+
+    reply = redisCommand(c, "KEYS S:*");
+    if (reply->type == REDIS_REPLY_ARRAY) {
+        int j;
+
+        for (j = 0; j < reply->elements; j++) {
+            suffix = parse_streamid(reply->element[j]->str, &id);
+            flushed++;
+            err = peek_huadan(&id, suffix);
+            if (err) {
+                hvfs_err(lib, "peek_huadan() '%s' failed w/ %d\n",
+                         reply->element[j]->str, err);
+            }
+        }
+    }
+    freeReplyObject(reply);
+}
+
+void peek_all_stream()
+{
+    redisContext *c;
+    int i;
+
+    if (g_local) {
+        /* get interface address */
+        struct ifaddrs *ifaddr, *ifa;
+        int family, s;
+        char host[NI_MAXHOST];
+
+        if (getifaddrs(&ifaddr) == -1) {
+            hvfs_err(lib, "getifaddrs() failed w/ %s\n", strerror(-errno));
+            return;
+        }
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL)
+                continue;
+
+            family = ifa->ifa_addr->sa_family;
+            if (family == AF_INET) {
+                s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                                host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                if (s != 0) {
+                    printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                    exit(EXIT_FAILURE);
+                }
+
+                for (i = 0; i < xg->asize; i++) {
+                    if (strcmp(host, xg->sites[i].node) == 0) {
+                        hvfs_info(lib, "PEEK local server[%d] %s:%d\n",
+                                  i, xg->sites[i].node, xg->sites[i].port);
+                        c = xg->sites[i].context;
+                        peek_stream(c);
+                    }
+                }
+            }
+        }
+    } else {
+        for (i = 0; i < xg->asize; i++) {
+            c = xg->sites[i].context;
+            peek_stream(c);
+        }
+    }
+}
+
+int use_db(int db)
+{
+    redisContext *c;
+    redisReply *reply;
+    int err = 0, i;
+    
     for (i = 0; i < xg->asize; i++) {
         c = xg->sites[i].context;
-        pop_stream(c);
+        do {
+            reply = redisCommand(c, "SELECT %d", db);
+            if (reply->type == REDIS_REPLY_STATUS) {
+                if (strcmp(reply->str, "OK") == 0) {
+                    hvfs_info(lib, "Server[%d]: Select to use Database %d\n", 
+                              i, db);
+                    break;
+                }
+            }
+            freeReplyObject(reply);
+            hvfs_err(lib, "Select to use Database %d failed\n", db);
+            
+            return err;
+        } while (0);
+        freeReplyObject(reply);
     }
+
+    return err;
+}
+
+int set_file_size(char *pathname, long osize)
+{
+    redisContext *c;
+    redisReply *reply;
+    long saved;
+    int err = 0;
+
+    /* Use 0the server */
+    c = xg->sites[0].context;
+
+    /* use db 0 */
+    do {
+        redisReply *reply;
+        
+        reply = redisCommand(c, "SELECT 0");
+        if (reply->type == REDIS_REPLY_STATUS) {
+            if (strcmp(reply->str, "OK") == 0) {
+                hvfs_info(lib, "Select to use Database 1\n");
+                break;
+            }
+        }
+        hvfs_err(lib, "Select to use Database 1 failed!\n");
+        return err;
+    } while (0);
+
+    reply = redisCommand(c, "GETSET FS:%s %ld", pathname, g_doffset);
+    if (reply->type == REDIS_REPLY_NIL) {
+        hvfs_info(lib, "Init file %s size to %ld!\n",
+                  pathname, g_doffset);
+        saved = osize;
+    } else if (reply->type == REDIS_REPLY_STRING) {
+        if (reply->str)
+            saved = atol(reply->str);
+    } else {
+        hvfs_warning(lib, "Not an integer string reply? set failed %s\n",
+                     reply->str);
+        err = -EINVAL;
+    }
+    freeReplyObject(reply);
+
+    if (saved != osize) {
+        hvfs_warning(lib, "Someone changed the file length? new(%ld) vs %ld\n",
+                     saved, osize);
+    }
+
+    return err;
 }
 
 int init_server_ring(char *conf_file, struct chring *ring)
@@ -681,9 +953,17 @@ int init_server_ring(char *conf_file, struct chring *ring)
                 goto out;
             }
             j++;
+        } else if (strcmp(cs[i].type, "client") == 0) {
+            g_client_nr++;
+            err = xnet_group_add(&xg_client, cs[i].id, cs[i].node, cs[i].port);
+            if (err) {
+                hvfs_err(lib, "add client to XG failed w/ %d\n", err);
+                goto out;
+            }
         }
     }
     hvfs_info(lib, "Total Server number is %d\n", j);
+    hvfs_info(lib, "Total Client number is %d\n", g_client_nr);
     ring_resort_nolock(ring);
     ring_stat(ring, j);
 
@@ -705,6 +985,11 @@ int process_table(void *data, int cnt, const char **cv)
     char *p, *q;
     int i, EOS = 0, isact = 0, isfrg = 0;
 
+    if (cnt < m->table_cnr) {
+        /* ignore this line */
+        corrupt_nr++;
+        goto update_pos;
+    }
     for (i = 0; i < m->table_cnr; i++) {
         hvfs_debug(lib, "%s = %s\n", m->table_names[i], cv[i]);
         UPDATE_FIELD(id, i, 1, jlsj, atol, cv);
@@ -749,13 +1034,13 @@ int process_table(void *data, int cnt, const char **cv)
         if (!id.direction || !id.protocol) {
             /* invalid direction, ignore it */
             ignore_nr++;
-            return 0;
+            goto update_pos;
         }
     } else {
         if (!id.direction || !id.protocol || !(isact && !isfrg)) {
             /* invalid direction, ignore it */
             ignore_nr++;
-            return 0;
+            goto update_pos;
         }
     }
 
@@ -769,31 +1054,54 @@ int process_table(void *data, int cnt, const char **cv)
     addOrUpdateStream(&id, 0);
     process_nr++;
 
+    /* update the current valid stream offset */
+update_pos:
+    {
+        long __off = ftell(g_dfp);
+
+        if (__off > 0) {
+            g_doffset = __off;
+        }
+    }
+
     return 0;
 }
 
-int parse_csv_file(char *filepath)
+int parse_csv_file(char *filepath, long offset)
 {
     FILE *fp;
-    int err = 0;
-
+    
     if ((fp = fopen(filepath, "r")) == NULL) {
-        hvfs_err(lib, "Cannot open input file '%s'\n", filepath);
-        return errno;
+        hvfs_err(lib, "Cannot open input file '%s' for %s\n", 
+                 filepath, strerror(errno));
+        return -errno;
+    }
+    if (offset > 0) {
+        if (fseek(fp, offset, SEEK_SET) < 0) {
+            hvfs_err(lib, "fseek stream to POS %ld failed w/ %s\n",
+                     offset, strerror(errno));
+            return -errno;
+        }
+        g_doffset = offset;
     }
 
-    switch (csv_parse(fp, process_table, &m)) {
+    g_dfp = fp;
+    
+    switch (csv_parse_eof(fp, process_table, &m)) {
     case E_LINE_TOO_WIDE:
         hvfs_err(lib, "Error parsing csv: line too wide.\n");
         break;
     case E_QUOTED_STRING:
         hvfs_err(lib, "Error parsing csv: ill-formatted quoted string.\n");
         break;
+    case E_PARTITAL_LINE:
+        hvfs_err(lib, "Error parsing csv: partitial line.\n");
+        break;
     }
     
     fclose(fp);
 
-    return err;
+    return offset;
 }
 
 void fina_xg(struct xnet_group *xg)
@@ -807,14 +1115,137 @@ void fina_xg(struct xnet_group *xg)
     xfree(xg);
 }
 
-int main(int argc, char *argv[]) {
-    struct timeval begin, end;
-    redisContext *c;
-    redisReply *reply;
-    char *str, *conf_file, *data_file, *huadan_file, *ipdb_file, *value;
-    int err = 0, i, j, id = -1;
+int is_action_valid(char *action)
+{
+    int valid = 1;
+    
+    if (!action)
+        return 1;
 
-    struct timeval timeout = { 10, 500000 }; // 10.5 seconds
+    if (strcmp(action, "load") == 0) {
+        g_action |= ACTION_LOAD_DATA;
+    } else if (strcmp(action, "peek") == 0) {
+        g_action |= ACTION_PEEK_HUADAN;
+    } else if (strcmp(action, "pop") == 0) {
+        g_action |= ACTION_POP_HUADAN;
+    } else if (strcmp(action, "noop") == 0) {
+        g_action |= ACTION_NOOP;
+    } else if (strcmp(action, "test") == 0) {
+        g_action |= ACTION_TEST;
+    } else {
+        valid = 0;
+    }
+
+    return valid;
+}
+
+void do_help()
+{
+    hvfs_plain(lib, 
+               "Copyright (c) 2012 Ma Can, IIE\n"
+               "Version 1.0.0a\n\n"
+               "Arguments:\n"
+               "-d, --id #num\tClient ID.\n"
+               "-r, --round #num\tWhich round this client belongs to.\n"
+               "-a, --action STR\t'load', 'peek', or 'pop'.\n"
+        );
+}
+
+static inline int do_load_data(char *data_file, long offset)
+{
+    long off = parse_csv_file(data_file, offset);
+    use_db(0);
+    mark_end_self();
+    return off;
+}
+
+static inline void do_peek_huadan()
+{
+    peek_all_stream();
+}
+
+static inline void do_pop_huadan()
+{
+    pop_all_stream();
+    use_db(0);
+    clear_pop_barrier();
+}
+
+void do_test()
+{
+    struct timeval begin, end;
+    /* add or update a stream statis entry */
+    struct streamid stream = {
+        .fwqip = 1010812,
+        .fwqdk = 80,
+        .khdip = 200020802,
+        .khddk = 2000,
+        .direction = 1,
+        .protocol = 1,
+
+        .jlsj = 11800,
+        .jcsj = 11701,
+        .cljip = 30002,
+        .bs = 800,
+        .zjs = 3800,
+        .gjlx = 8,
+    };
+    struct streamstat stat;
+    int i, j, err;
+    char *str;
+
+    gettimeofday(&begin, NULL);
+    for (i = 0; i < 1000; i++) {
+        stream.fwqip++;
+        for (j = 0; j < 10; j++) {
+            stream.direction = j % 2 + 1;
+            if (j > 7) {
+                stream.direction <<= 2;
+            }
+            stream.zjs++;
+            stream.jlsj++;
+            stream.jcsj++;
+            str = printStreamid(&stream);
+            hvfs_debug(lib, "+ %s DON %d\n", str, stream.direction); free(str);
+            err = addOrUpdateStream(&stream, 0);
+        }
+    }
+    gettimeofday(&end, NULL);
+    printf("+ err %d\n", err);
+    printf("P %.2lf\n", 10000 / ((end.tv_sec + end.tv_usec / 1000000.0) - 
+                                   (begin.tv_sec + begin.tv_usec / 1000000.0)));
+    stream.fwqip = 10813;
+    getStreamStat(&stream, 0, &stat, DO_POP_RENAME);
+    str = printStreamStat(&stream, &stat);
+    printf("= %s\n", str); free(str);
+}
+
+int main(int argc, char *argv[]) {
+    redisContext *c;
+    char *action = NULL, *conf_file = NULL, *data_file = NULL, 
+        *huadan_file = NULL, *log_file = NULL, *ipdb_file = NULL, *value;
+    long offset = 0;
+    int err = 0, is_fork = 0, i, db = 3;
+
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgD:";
+    struct option longflags[] = {
+        {"id", required_argument, 0, 'd'},
+        {"round", required_argument, 0, 'r'},
+        {"action", required_argument, 0, 'a'},
+        {"offset", required_argument, 0, 's'},
+        {"input", required_argument, 0, 'i'},
+        {"output", required_argument, 0, 'o'},
+        {"log", required_argument, 0, 'x'},
+        {"config", required_argument, 0, 'c'},
+        {"ipdb", required_argument, 0, 'b'},
+        {"ignoreact", required_argument, 0, 'A'},
+        {"database", required_argument, 0, 'D'},
+        {"isfork", no_argument, 0, 'f'},
+        {"local", no_argument, 0, 'l'},
+        {"debug", no_argument, 0, 'g'},
+        {"help", no_argument, 0, 'h'},
+    };
     TABLE_DEF(orig_log, 18);
     TABLE_FIELD(orig_log, int, rzlx);
     TABLE_FIELD(orig_log, unsigned long, jlsj);
@@ -838,44 +1269,122 @@ int main(int argc, char *argv[]) {
     m.table_types = TABLE_TYPES(orig_log);
     m.table_cnr = TABLE_NR(orig_log);
 
-    if (argc >= 2) {
-        id = atoi(argv[1]);
-    }
-    g_id = id;
-    hvfs_info(lib, "Self ID: %d\n", id);
-    
+    /* get env */
     value = getenv("config");
     if (value) {
         conf_file = strdup(value);
-    } else {
-        hvfs_err(lib, "Please set config=/path/to/config/file in ENV.\n");
-        return EINVAL;
-    }
-    value = getenv("data");
-    if (value) {
-        data_file = strdup(value);
-    } else {
-        hvfs_err(lib, "Please set data=/path/to/data/file in ENV.\n");
-        return EINVAL;
-    }
-    value = getenv("huadan");
-    if (value) {
-        huadan_file = strdup(value);
-    } else {
-        hvfs_err(lib, "Please set huadan=/path/to/huadan/file in ENV.\n");
-        return EINVAL;
     }
     value = getenv("ipdb");
     if (value) {
         ipdb_file = strdup(value);
-    } else {
-        hvfs_err(lib, "Please set ipdb=/path/to/ip/db in ENV.\n");
-        return EINVAL;
     }
     value = getenv("ignoreact");
     if (value) {
         g_sc.ignoreact = atoi(value) > 0 ? 1 : 0;
     }
+
+    /* get args */
+    while (1) {
+        int longindex = -1;
+        int opt = getopt_long(argc, argv, shortflags, longflags, &longindex);
+        if (opt == -1)
+            break;
+        switch (opt) {
+        case 'd':
+            g_id = atoi(optarg);
+            break;
+        case 'r':
+            g_round = atoi(optarg);
+            break;
+        case 'a':
+            action = strdup(optarg);
+            break;
+        case 's':
+            offset = atol(optarg);
+            break;
+        case 'i':
+            data_file = strdup(optarg);
+            break;
+        case 'o':
+            huadan_file = strdup(optarg);
+            break;
+        case 'x':
+            log_file = strdup(optarg);
+            break;
+        case 'f':
+            is_fork = 1;
+            break;
+        case 'c':
+            if (conf_file)
+                xfree(conf_file);
+            conf_file = strdup(optarg);
+            break;
+        case 'b':
+            if (ipdb_file)
+                xfree(ipdb_file);
+            ipdb_file = strdup(optarg);
+            break;
+        case 'A':
+            g_sc.ignoreact = atoi(optarg) > 0 ? 1 : 0;
+            break;
+        case 'D':
+            db = atoi(optarg);
+            break;
+        case 'h':
+        case '?':
+            do_help();
+            return EINVAL;
+        case 'l':
+            g_local = 1;
+            break;
+        case 'g':
+            hvfs_lib_tracing_flags = 0xffffffff;
+            break;
+        default:
+            hvfs_err(lib, "Invalid arguments!\n");
+            return EINVAL;
+        }
+    };
+
+    if (log_file) {
+        /* close stdout */
+        close(1);
+        int fd = open(log_file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        if (fd < 0) {
+            hvfs_err(lib, "open() failed w/ %s\n", strerror(errno));
+            return EINVAL;
+        }
+        if (fd != 1) {
+            hvfs_err(lib, "log file open failed != 1\n");
+            return EINVAL;
+        }
+    }
+    
+    if (!is_action_valid(action)) {
+        hvfs_err(lib, "Invalid action '%s'\n", action);
+        return EINVAL;
+    }
+    if (!data_file && (g_action & (ACTION_POP_HUADAN | ACTION_PEEK_HUADAN))) {
+        /* it is ok */
+        ;
+    } else if (!huadan_file && (g_action & ACTION_LOAD_DATA)) {
+        /* it is ok */
+        ;
+    } else if (!data_file || !huadan_file || !conf_file || !ipdb_file) {
+        hvfs_err(lib, "Please set input/output/config/ipdb files in ARGV.\n");
+        return EINVAL;
+    }
+
+    if (g_id != 0 && g_local) {
+        hvfs_warning(lib, "When argument 'local' is set, you have to "
+                     "keep client ID to ZERO.\n");
+        return EINVAL;
+    }
+    
+    hvfs_info(lib, "Self ID: %d\n", g_id);
+    hvfs_info(lib, "Round  : %d\n", g_round);
+    hvfs_info(lib, "ACTION : %s\n", action);
+    
 
     /* open ipdb file */
     dbfp = fopen(ipdb_file, "rb");
@@ -913,74 +1422,87 @@ int main(int argc, char *argv[]) {
     }
     hvfs_info(lib, "Server connections has established!\n");
 
-    huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
-    if (huadan_fd < 0) {
-        hvfs_err(lib, "open file '%s' failed w/ %s\n",
-                 huadan_file, strerror(errno));
-        return errno;
+    if (g_action & ACTION_POP_HUADAN || g_action & ACTION_PEEK_HUADAN) {
+        huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+        if (huadan_fd < 0) {
+            hvfs_err(lib, "open file '%s' failed w/ %s\n",
+                     huadan_file, strerror(errno));
+            return errno;
+        }
+        hvfs_info(lib, "Open HUADAN file '%s' in APPEND mode\n", huadan_file);
     }
-    hvfs_info(lib, "Open HUADAN file '%s' in APPEND mode\n", huadan_file);
 
-    err = parse_csv_file(data_file);
-
-    goto out;
+    /* which db should i use? */
+    err = use_db(db);
+    if (err) {
+        hvfs_err(lib, "USE DB %d failed w/ %d\n", db, err);
+        return err;
+    } else {
+        hvfs_info(lib, "USE DB %d OK\n", db);
+    }
     
-    /* add or update a stream statis entry */
-    struct streamid stream = {
-        .fwqip = 1010812,
-        .fwqdk = 80,
-        .khdip = 200020802,
-        .khddk = 2000,
-        .direction = 1,
-        .protocol = 1,
-
-        .jlsj = 11800,
-        .jcsj = 11701,
-        .cljip = 30002,
-        .bs = 800,
-        .zjs = 3800,
-        .gjlx = 8,
-    };
-    struct streamstat stat;
-
-    gettimeofday(&begin, NULL);
-    for (i = 0; i < 1000; i++) {
-        stream.fwqip++;
-        for (j = 0; j < 10; j++) {
-            stream.direction = j % 2 + 1;
-            if (j > 7) {
-                stream.direction <<= 2;
-            }
-            stream.zjs++;
-            stream.jlsj++;
-            stream.jcsj++;
-            str = printStreamid(&stream);
-            hvfs_debug(lib, "+ %s DON %d\n", str, stream.direction); free(str);
-            err = addOrUpdateStream(&stream, 0);
+    if (g_action == ACTION_NOOP) {
+    } else {
+        if (g_action & ACTION_LOAD_DATA) {
+            do_load_data(data_file, offset);
+        }
+        if (g_action & ACTION_PEEK_HUADAN) {
+            do_peek_huadan();
+        }
+        if (g_action & ACTION_POP_HUADAN) {
+            do_pop_huadan();
+        }
+        if (g_action & ACTION_TEST) {
+            do_test();
         }
     }
-    gettimeofday(&end, NULL);
-    printf("+ err %d\n", err);
-    printf("P %.2lf\n", 1000000 / ((end.tv_sec + end.tv_usec / 1000000.0) - 
-                                   (begin.tv_sec + begin.tv_usec / 1000000.0)));
-    stream.fwqip = 10813;
-    getStreamStat(&stream, 0, &stat, 1);
-    str = printStreamStat(&stream, &stat);
-    printf("= %s\n", str); free(str);
 
+    hvfs_info(lib, "Address Translation Stats:\n");
     for (i = 0; i < xg->asize; i++) {
-        hvfs_info(lib, "Server[%ld]: %ld\n", xg->sites[i].site_id, xg->sites[i].nr);
+        hvfs_info(lib, " Server[%ld]: %ld\n", xg->sites[i].site_id, xg->sites[i].nr);
     }
 
-out:
-    pop_all_stream();
     close(huadan_fd);
     fclose(dbfp);
-    hvfs_info(lib, "+Success. \n"
+
+    /* update the file length now */
+    switch (g_action & (ACTION_LOAD_DATA | ACTION_POP_HUADAN | ACTION_PEEK_HUADAN)) {
+    case ACTION_LOAD_DATA:
+        break;
+    case ACTION_POP_HUADAN:
+        g_doffset = -1;
+        break;
+    case ACTION_PEEK_HUADAN:
+        g_doffset = -2;
+        break;
+    default:
+        g_doffset = -3;
+    }
+    if (is_fork) {
+        /* write the g_doffset to stdin */
+        int bw, bl = 0;
+        
+        do {
+            bw = write(0, ((void *)&g_doffset) + bl, sizeof(g_doffset) - bl);
+            if (bw < 0) {
+                hvfs_err(lib, "write offset back to parent process failed w/ %s\n",
+                         strerror(errno));
+                break;
+            }
+            bl += bw;
+        } while (bl < sizeof(g_doffset));
+        hvfs_info(lib, "Write offset back to parent process done.\n");
+    } else if (g_doffset >= 0) {
+        set_file_size(data_file, offset);
+    }
+    
+    hvfs_info(lib, "+Success to OFFSET %ld \n"
               "Stream Line Stat NRs => "
-              "Process %ld, Ignore %ld, "
+              "Process %ld, Corrupt %ld, Ignore %ld, "
               "Huadan {pop %ld {pop %ld, flush %ld}, peek %ld} \n",
-              process_nr, ignore_nr, pop_huadan_nr, poped, flushed, peek_huadan_nr);
+              g_doffset,
+              process_nr, corrupt_nr, ignore_nr, 
+              pop_huadan_nr, poped, flushed, peek_huadan_nr);
     fina_xg(xg);
 
     return 0;

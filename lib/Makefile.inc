@@ -2,7 +2,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-11-23 16:26:23 macan>
+# Time-stamp: <2012-12-07 11:33:50 macan>
 #
 # This is the makefile for HVFS project.
 #
@@ -64,7 +64,7 @@ LFLAGS += -L$(JEMALLOC_HOME)/lib -ljemalloc
 endif
 
 # Region for depend files
-LIB_AR_SOURCE = lib.c ring.c conf.c csv_parser.c
+LIB_AR_SOURCE = lib.c ring.c conf.c csv_parser.c segv.c
 LIB_H_SOURCE = lib.h ring.h memory.h hvfs_u.h tracing.h err.h xlist.h xlock.h \
                csv_parser.h
 

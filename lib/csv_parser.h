@@ -20,7 +20,8 @@
 */
 
 enum { E_LINE_TOO_WIDE=-2, // error code for line width >= MAX_LINE_LEN
-	   E_QUOTED_STRING	 // error code for ill-formatted quoted string
+	   E_QUOTED_STRING=-3,	 // error code for ill-formatted quoted string
+       E_PARTITAL_LINE=-4,
 };
 
 // mimic sqlite callback interface
@@ -33,5 +34,6 @@ typedef int (*CSV_CB_record_handler)
 );
 
 int csv_parse (FILE *fp, CSV_CB_record_handler cb, void *params);
+int csv_parse_eof (FILE *fp, CSV_CB_record_handler cb, void *params);
 
 #endif

@@ -187,7 +187,6 @@ int code_convert(char *from_charset, char *to_charset, char *inbuf, size_t inlen
                  char *outbuf, size_t outlen)
 {
     iconv_t cd;
-    int rc;
     char **pin = &inbuf;
     char **pout = &outbuf;
     

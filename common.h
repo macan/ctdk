@@ -4,9 +4,12 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-05 09:41:12 macan>
+ * Time-stamp: <2012-12-11 10:24:08 macan>
  *
  */
+
+#ifndef __COMMON_H__
+#define __COMMON_H__
 
 #define HVFS_TRACING
 
@@ -14,7 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
-
+#include <getopt.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
 #include "hiredis.h"
 #include "lib/ring.h"
 #include "lib/csv_parser.h"
@@ -163,3 +170,8 @@ struct stream_config
 #define INB_IGNORE              0x08 /* update on a closed stream */
 #define OUT_IGNORE              0x09 /* update on a closed stream */
 #define TIMED_IGNORE            0x0a /* update can not pass time restricts */
+
+void ipconv(char *ip, char *address, FILE *fp);
+int pop_huadan(struct streamid *id, int suffix, int flag);
+
+#endif

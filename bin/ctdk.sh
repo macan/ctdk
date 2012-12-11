@@ -3,7 +3,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-12-04 15:38:42 macan>
+# Time-stamp: <2012-12-11 13:08:59 macan>
 #
 # This is the mangement script for Pomegranate
 #
@@ -78,6 +78,16 @@ function do_conf_check() {
     fi
 }
 
+function isdigit ()    # Tests whether *entire string* is numerical.
+{             # In other words, tests for integer variable.
+  [ $# -eq 1 ] || return 1
+
+  case $1 in
+    *[!0-9]*|"") return 1;;
+              *) return 0;;
+  esac
+}
+
 # check if the config file exists.
 do_conf_check $CONFIG_FILE
 do_conf_check $HVFS_HOME/conf/redis.conf
@@ -132,14 +142,14 @@ function adjust_syn() {
 }
 
 function start_client() {
-    if [ "x$1" == "x" ]; then
+    if ! isdigit $1; then
         ipnr=`cat $CONFIG_FILE | grep "^client:" | awk -F: '{print $2":"$4":"$3}'`
         for x in $ipnr; do 
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
             port=`echo $x | awk -F: '{print $3}'`
-            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5'$HVFS_HOME'\6|'`
-            $SSH $UN$ip "$RC_CMD $HVFS_HOME/ctdk_huadan_1d $id > $LOG_DIR/client.$id.log" > /dev/null &
+            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2|'`
+            $SSH $UN$ip "cd $HVFS_HOME; $RC_CMD $HVFS_HOME/ctdk_huadan_1d -d $id $@ > $LOG_DIR/client.$id.log" > /dev/null &
         done
         echo "Start clients done."
     else
@@ -148,8 +158,8 @@ function start_client() {
             ip=`echo $x | awk -F: '{print $1}'`
             id=`echo $x | awk -F: '{print $2}'`
             port=`echo $x | awk -F: '{print $3}'`
-            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)$ID\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2'$id'\3'$HVFS_HOME'\4'$id'\5'$HOME'\6|'`
-            $SSH $UN$ip "$RC_CMD $HVFS_HOME/ctdk_huadan_1d $id > $LOG_DIR/client.$id.log" > /dev/null &
+            RC_CMD=`echo $RC_CMD | sed -e 's|\(.*\)$HOME\(.*\)|\1'$HVFS_HOME'\2|'`
+            $SSH $UN$ip "cd $HVFS_HOME; $RC_CMD $HVFS_HOME/ctdk_huadan_1d -d $id $@ > $LOG_DIR/client.$id.log" > /dev/null &
             echo "Start client $id done."
         done
     fi
@@ -191,7 +201,7 @@ function stop_client() {
     for x in $ipnr; do 
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
-        PID=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | awk '{print $2}'`
+        PID=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d -d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | awk '{print $2}'`
         $SSH $UN$ip "kill -s SIGTERM $PID 2>&1 > /dev/null" > /dev/null
         echo "stop client[$id] pid $PID."
     done
@@ -223,7 +233,7 @@ function kill_client() {
     for x in $ipnr; do 
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
-        PID=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | awk '{print $2}'`
+        PID=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d -d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | awk '{print $2}'`
         $SSH $UN$ip "kill -9 $PID 2>&1 > /dev/null" > /dev/null
         echo "kill client[$id] pid $PID."
     done
@@ -266,11 +276,16 @@ function stat_client() {
     for x in $ipnr; do 
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
-        NR=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | wc -l`
-        if [ "x$NR" == "x1" ]; then
-            echo "CLIENT $id is running."
-        else
+        #NR=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d -d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | wc -l`
+        CPID=`$SSH $UN$ip "ps aux" | grep "ctdk_huadan_1d -d $id" | grep -v bash | grep -v ssh | grep -v expect | grep -v grep | awk '{print $2}'`
+        if [ "x$CPID" == "x" ]; then
             echo "CLIENT $id is gone."
+        else
+            for f in $CPID; do
+                if [ "$f" -gt "1" ]; then
+                    echo "CLIENT $id is running (ip: $ip, pid: $f)."
+                fi
+            done
         fi
     done
 }
@@ -285,7 +300,7 @@ function stat_server() {
         if [ "x$NR" == "x-1" ]; then
             echo "SERVER $id is gone."
         else
-            echo "SERVER $id is running (pid: $NR)."
+            echo "SERVER $id is running (ip: $ip, pid: $NR)."
         fi
     done
 }
@@ -304,11 +319,26 @@ function do_size() {
         ip=`echo $x | awk -F: '{print $1}'`
         id=`echo $x | awk -F: '{print $2}'`
         port=`echo $x | awk -F: '{print $3}'`
-        NR=`echo DBSIZE | $HVFS_HOME/bin/redis-cli -h $ip -p $port | cut -f2`
-        let TNR=$TNR+$NR
-        echo "Server $id dbsize $NR"
+        echo "Server $id {"
+        NR=`echo INFO | $HVFS_HOME/bin/redis-cli -h $ip -p $port | grep "^db[0-9]*:" | sed -e "s/^\(.*\)/->\t\1/g"`
+        echo -e "$NR"
+        echo "}"
     done
-    echo "Total dbsize $TNR"
+}
+
+function do_cmd() {
+    echo "Do commands now ..."
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
+    TNR=0
+    for x in $ipnr; do 
+        ip=`echo $x | awk -F: '{print $1}'`
+        id=`echo $x | awk -F: '{print $2}'`
+        port=`echo $x | awk -F: '{print $3}'`
+        echo "Server $id {"
+        echo $@ | $HVFS_HOME/bin/redis-cli -h $ip -p $port | cut -f2
+        echo "}"
+    done
+    echo "Done!"
 }
 
 function do_clean() {
@@ -329,7 +359,7 @@ function do_help() {
     echo "Version 0.0.1b"
     echo "Copyright (c) 2012 Can Ma <ml.macana@gmail.com>"
     echo ""
-    echo "Usage: ctdk.sh [start|stop|kill] [server|client] [id]"
+    echo "Usage: ctdk.sh [start|stop|kill] [server|client] [id] [ARGS]"
     echo "               [clean|stat]"
     echo ""
     echo "Commands:"
@@ -358,7 +388,8 @@ if [ "x$1" == "xstart" ]; then
     if [ "x$2" == "xserver" ]; then
         start_server $3
     elif [ "x$2" == "xclient" ]; then
-        start_client $3
+        shift 2
+        start_client $@
     else
         start_all
     fi
@@ -386,6 +417,9 @@ elif [ "x$1" == "xsize" ]; then
     if [ "x$2" == "x" ]; then
         do_size
     fi
+elif [ "x$1" == "xcmd" ]; then
+    shift 1
+    do_cmd $@
 elif [ "x$1" == "xclean" ]; then
     do_clean
 elif [ "x$1" == "xrestart" ]; then

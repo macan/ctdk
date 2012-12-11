@@ -142,9 +142,17 @@ int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
 			NULL!= fgets (d.buff, MAX_LINE_LEN, fp) ) {
 		int r;
 
-        /* remove tailing $EOF$ */
-        if ((r = strlen(d.buff)) >= 5)
-            d.buff[r - 5] = '\0';
+        /* remove tailing $EOF$\n */
+        if ((r = strlen(d.buff)) >= 6) {
+            if (strncmp(d.buff + r - 6, "$EOF$", 5) == 0) {
+                d.buff[r - 6] = '\0';
+            } else {
+                /* partital line */
+                return E_PARTITAL_LINE;
+            }
+        } else {
+            return E_PARTITAL_LINE;
+        }
 		if(d.buff[MAX_LINE_LEN-1]=='\0' && d.buff[MAX_LINE_LEN-2]!='\n')
 			return E_LINE_TOO_WIDE;
 		if (E_QUOTED_STRING==(r=csv_parse_line (&d) ) )

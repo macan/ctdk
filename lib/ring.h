@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-11-23 10:42:48 macan>
+ * Time-stamp: <2012-12-05 16:59:12 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -114,5 +114,7 @@ int ring_del_point(struct chp *, struct chring *);
 int ring_add(struct chring *r, char *node, int port, int id, int vid_max);
 struct xnet_group *__get_active_site(struct chring *r);
 struct xnet_group_entry *find_site(struct xnet_group *xg, int site_id);
+void xnet_group_sort(struct xnet_group *xg);
+int xnet_group_add(struct xnet_group **xg, u64 site_id, char *node, int port);
 
 #endif
