@@ -4,12 +4,13 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-11 11:45:29 macan>
+ * Time-stamp: <2012-12-12 21:01:13 macan>
  *
  */
 
 #define HVFS_TRACING
 
+#include <sys/wait.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,10 +96,10 @@ struct job_info
 
 static struct job_info job_infos[] = {
     {"ctdk_1d_normal", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
-     "conf/single.conf", "conf/qqwry.dat", "data/huadan-%s-%d",
+     "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s-%d",
      "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld", "load", 1, 0, 0, 2, 10, 10, 13, 14,},
     {"ctdk_1d_pop", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
-     "conf/single.conf", "conf/qqwry.dat", "data/huadan-%s",
+     "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s",
      "logs/CTDK-CLI-LOG-%s-r%d-c%d-FINAL", "pop", 0, 0, 0, 2, 10, 10, 13, 14,},
 };
 #define JI_1D_NORMAL    0
@@ -567,7 +568,7 @@ int toggle_db(int flag);
 int add_job(char *pathname, long offset, struct job_info *ji)
 {
     char log[PATH_MAX];
-    char args[1024];
+    char output[1024], args[1024];
     char *filename, *p, *q, *date, *day;
     struct job_entry *pos;
     int nr = 0, rid = 0, cid = 0, found = 0, use_db;
@@ -645,10 +646,11 @@ int add_job(char *pathname, long offset, struct job_info *ji)
     }
     xlock_unlock(&g_huadan_lock);
     
+    sprintf(output, ji->output, date, cid);
     sprintf(log, ji->log, date, rid, cid, offset);
 
-    sprintf(args, "-a %s -r %d -d %d -s %ld -i %s -x %s -f -c %s -b %s -A %d",
-            ji->action, rid, cid, offset, pathname, log,
+    sprintf(args, "-a %s -r %d -d %d -s %ld -i %s -o %s -x %s -f -c %s -b %s -A %d",
+            ji->action, rid, cid, offset, pathname, output, log,
             ji->config, ji->ipdb, ji->ignoreact);
     hvfs_info(lib, "Start JOB: %s %s\n", ji->cmd, args);
 
@@ -670,11 +672,13 @@ int add_job(char *pathname, long offset, struct job_info *ji)
             "-d", cidstr,
             "-s", offsetstr,
             "-i", pathname,
+            "-o", output,
             "-x", log,
             "-c", ji->config,
             "-b", ji->ipdb,
             "-A", ignoreactstr,
             "-f",
+            "-g",
             "-D", dbstr,
             NULL,
         };
@@ -1067,8 +1071,11 @@ static void *__timer_thread_main(void *arg)
     /* then, we loop for the timer events */
     while (!g_timer_thread_stop) {
         err = sem_wait(&g_timer_sem);
-        if (err == EINTR)
-            continue;
+        if (err) {
+            if (errno == EINTR)
+                continue;
+            hvfs_err(lib, "sem_wait() failed w/ %s\n", strerror(errno));
+        }
 
         cur = time(NULL);
         /* should we work now */
@@ -1110,12 +1117,12 @@ int setup_timers(void)
     ac.sa_sigaction = __itimer_default;
     err = sigaction(SIGALRM, &ac, NULL);
     if (err) {
-        err = errno;
+        err = -errno;
         goto out;
     }
     err = getitimer(which, &pvalue);
     if (err) {
-        err = errno;
+        err = -errno;
         goto out;
     }
     interval = 1;
@@ -1126,7 +1133,7 @@ int setup_timers(void)
         value.it_value.tv_usec = 0;
         err = setitimer(which, &value, &ovalue);
         if (err) {
-            err = errno;
+            err = -errno;
             goto out;
         }
         hvfs_debug(lib, "OK, we have created a timer thread to "

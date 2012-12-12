@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-11 14:19:49 macan>
+ * Time-stamp: <2012-12-12 21:12:44 macan>
  *
  */
 
@@ -18,33 +18,40 @@ struct manager
     char **table_types;
 };
 
-struct chring server_ring;
-struct xnet_group *xg = NULL;
-struct xnet_group *xg_client = NULL;
-struct manager m;
-int huadan_fd = 1;
-FILE *dbfp = NULL;
-FILE *g_dfp = NULL;
-long g_doffset = 0;
+static struct chring server_ring;
+static struct xnet_group *xg = NULL;
+static struct xnet_group *xg_client = NULL;
+static struct manager m;
+static char *g_input = NULL;
+static int huadan_fd = -1;
+static FILE *dbfp = NULL;
+static FILE *g_dfp = NULL;
+static long g_doffset = 0;
+static long g_last_offset = 0;
+static int g_interval = 10;
 
 #define HUADAN_FSYNC_NR         1000
-long pop_huadan_nr = 0;
-long peek_huadan_nr = 0;
-long process_nr = 0;
-long corrupt_nr = 0;
-long ignore_nr = 0;
-long poped = 0;
-long flushed = 0;
-int g_id = -1;
-int g_round = -1;
-int g_local = 0;
+static long pop_huadan_nr = 0;
+static long peek_huadan_nr = 0;
+static long process_nr = 0;
+static long corrupt_nr = 0;
+static long ignore_nr = 0;
+static long poped = 0;
+static long flushed = 0;
+static int g_id = -1;
+static int g_round = -1;
+static int g_local = 0;
 #define ACTION_NOOP             0x00
 #define ACTION_LOAD_DATA        0x01
 #define ACTION_PEEK_HUADAN      0x02
 #define ACTION_POP_HUADAN       0x04
 #define ACTION_TEST             0x80
-int g_action = 0;
-int g_client_nr = 0;
+static int g_action = 0;
+static int g_client_nr = 0;
+
+static pthread_t g_timer_thread = 0;
+static int g_timer_thread_stop = 0;
+static sem_t g_timer_sem;
 
 static struct stream_config g_sc = {
     .ignoreact = 1,
@@ -199,14 +206,14 @@ redisContext *get_server_from_key(char *key)
     struct chp *p;
     struct xnet_group_entry *e;
 
-    if (!xg) {
+    if (unlikely(!xg)) {
         hvfs_err(lib, "Server group has not been initialized.\n");
         return NULL;
     }
     p = ring_get_point(key, &server_ring);
     hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
-    e = find_site(xg, p->site_id);
-    if (!e) {
+    e = p->private;
+    if (unlikely(!e)) {
         hvfs_err(lib, "Server %ld doesn't exist.\n", p->site_id);
         return NULL;
     }
@@ -743,9 +750,6 @@ void pop_all_stream()
     redisContext *c;
     int i;
 
-    /* wait for other clients */
-    wait_for_all_end();
-    
     /* only pop the streams on my own host */
     if (g_local) {
         /* get interface address */
@@ -892,8 +896,19 @@ int set_file_size(char *pathname, long osize)
     long saved;
     int err = 0;
 
-    /* Use 0the server */
-    c = xg->sites[0].context;
+    /* Use 0the server, connect it each time */
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+
+    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
+    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
+                                timeout);
+    if (c->err) {
+        hvfs_plain(lib, "failed w/ %d\n", c->err);
+        return -1;
+    } else {
+        hvfs_plain(lib, "ok.\n");
+    }
 
     /* use db 0 */
     do {
@@ -902,11 +917,11 @@ int set_file_size(char *pathname, long osize)
         reply = redisCommand(c, "SELECT 0");
         if (reply->type == REDIS_REPLY_STATUS) {
             if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "Select to use Database 1\n");
+                hvfs_info(lib, "Select to use Database 0\n");
                 break;
             }
         }
-        hvfs_err(lib, "Select to use Database 1 failed!\n");
+        hvfs_err(lib, "Select to use Database 0 failed!\n");
         return err;
     } while (0);
 
@@ -929,8 +944,159 @@ int set_file_size(char *pathname, long osize)
         hvfs_warning(lib, "Someone changed the file length? new(%ld) vs %ld\n",
                      saved, osize);
     }
+    g_last_offset = saved;
+
+    redisFree(c);
 
     return err;
+}
+
+int check_conflict(char *pathname, pid_t pid)
+{
+    redisContext *c;
+    redisReply *reply;
+    int err = 0;
+
+    /* Use 0the server, connect it each time */
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+
+    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
+    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
+                                timeout);
+    if (c->err) {
+        hvfs_plain(lib, "failed w/ %d\n", c->err);
+        return -1;
+    } else {
+        hvfs_plain(lib, "ok.\n");
+    }
+
+    /* use db 0 */
+    do {
+        redisReply *reply;
+        
+        reply = redisCommand(c, "SELECT 0");
+        if (reply->type == REDIS_REPLY_STATUS) {
+            if (strcmp(reply->str, "OK") == 0) {
+                hvfs_info(lib, "Select to use Database 0\n");
+                break;
+            }
+        }
+        hvfs_err(lib, "Select to use Database 0 failed!\n");
+        return err;
+    } while (0);
+
+    reply = redisCommand(c, "SETNX HB:%s %ld", pathname, (long)pid);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        if (reply->integer == 0) {
+            /* key conflict */
+            err = -EEXIST;
+            goto out;
+        } else {
+            hvfs_info(lib, "SET HB:%s to %ld!\n", pathname, (long)pid);
+        }
+    } else {
+        hvfs_warning(lib, "Not an integer string reply? set failed %s\n",
+                     reply->str);
+        err = -EINVAL;
+        goto out;
+    }
+    freeReplyObject(reply);
+
+    /* update TTL */
+    reply = redisCommand(c, "EXPIRE HB:%s %d", 
+                         pathname, 3 * g_interval);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        if (reply->integer == 0) {
+            /* key not exist?!! */
+            err = check_conflict(pathname, pid);
+            if (err) {
+                hvfs_err(lib, "Someone else started, let us exit now.\n");
+                exit(err);
+            }
+        }
+    } else {
+        hvfs_warning(lib, "Not an integer reply? HB failed %s\n",
+                     reply->str);
+        err = -EINVAL;
+    }
+    freeReplyObject(reply);
+
+out:
+    redisFree(c);
+
+    return err;
+}
+
+int do_HB(char *pathname, pid_t pid)
+{
+    redisContext *c;
+    redisReply *reply;
+    int err = 0;
+
+    /* Use 0the server, connect it each time */
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+
+    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
+    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
+                                timeout);
+    if (c->err) {
+        hvfs_plain(lib, "failed w/ %d\n", c->err);
+        return -1;
+    } else {
+        hvfs_plain(lib, "ok.\n");
+    }
+
+    /* use db 0 */
+    do {
+        redisReply *reply;
+        
+        reply = redisCommand(c, "SELECT 0");
+        if (reply->type == REDIS_REPLY_STATUS) {
+            if (strcmp(reply->str, "OK") == 0) {
+                hvfs_info(lib, "Select to use Database 0\n");
+                break;
+            }
+        }
+        hvfs_err(lib, "Select to use Database 0 failed!\n");
+        return err;
+    } while (0);
+
+    reply = redisCommand(c, "EXPIRE HB:%s %d", 
+                         pathname, 3 * g_interval);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        if (reply->integer == 0) {
+            /* key not exist?!! */
+            err = check_conflict(pathname, pid);
+            if (err) {
+                hvfs_err(lib, "Someone else started, let us exit now.\n");
+                exit(err);
+            }
+        }
+    } else {
+        hvfs_warning(lib, "Not an integer reply? HB failed %s\n",
+                     reply->str);
+        err = -EINVAL;
+    }
+    freeReplyObject(reply);
+    
+    redisFree(c);
+
+    return err;
+}
+
+void __update_server_ring(struct chring *ring, struct xnet_group *xg)
+{
+    int i, j;
+
+    for (i = 0; i < xg->asize; i++) {
+        for (j = 0; j < ring->used; j++) {
+            if (ring->array[j].site_id == xg->sites[i].site_id) {
+                ring->array[j].private = &xg->sites[i];
+            }
+        }
+    }
 }
 
 int init_server_ring(char *conf_file, struct chring *ring)
@@ -1048,8 +1214,10 @@ int process_table(void *data, int cnt, const char **cv)
         id.direction = (id.direction << 2) & 0xf;
     }
     
-    p = printStreamid(&id);
-    hvfs_debug(lib, " => %s\n", p); free(p);
+    if (IS_HVFS_DEBUG(lib)) {
+        p = printStreamid(&id);
+        hvfs_debug(lib, " => %s\n", p); free(p);
+    }
 
     addOrUpdateStream(&id, 0);
     process_nr++;
@@ -1153,10 +1321,7 @@ void do_help()
 
 static inline int do_load_data(char *data_file, long offset)
 {
-    long off = parse_csv_file(data_file, offset);
-    use_db(0);
-    mark_end_self();
-    return off;
+    return parse_csv_file(data_file, offset);
 }
 
 static inline void do_peek_huadan()
@@ -1167,8 +1332,6 @@ static inline void do_peek_huadan()
 static inline void do_pop_huadan()
 {
     pop_all_stream();
-    use_db(0);
-    clear_pop_barrier();
 }
 
 void do_test()
@@ -1220,6 +1383,119 @@ void do_test()
     printf("= %s\n", str); free(str);
 }
 
+static void __itimer_default(int signo, siginfo_t *info, void *arg)
+{
+    sem_post(&g_timer_sem);
+    hvfs_verbose(lib, "Did this signal handler called?\n");
+
+    return;
+}
+
+static void *__timer_thread_main(void *arg)
+{
+    sigset_t set;
+    time_t cur, last = 0;
+    int err;
+
+    hvfs_debug(lib, "I am running...\n");
+
+    /* unblock the SIGALRM signal */
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+
+    /* then, we loop for the timer events */
+    while (!g_timer_thread_stop) {
+        err = sem_wait(&g_timer_sem);
+        if (err) {
+            if (errno == EINTR)
+                continue;
+            hvfs_err(lib, "sem_wait() failed w/ %s\n", strerror(errno));
+        }
+
+        cur = time(NULL);
+        if (last == 0)
+            last = cur;
+        /* should we work now */
+        if (cur - last > g_interval) {
+            hvfs_info(lib, ">>>>> Update Offset and HB Info >>>>\n");
+            last = cur;
+            set_file_size(g_input, g_last_offset);
+            do_HB(g_input, getpid());
+        }
+    }
+
+    hvfs_debug(lib, "Hooo, I am exiting...\n");
+    pthread_exit(0);
+}
+
+int setup_timers(int interval)
+{
+    struct sigaction ac;
+    sigset_t set;
+    struct itimerval value, ovalue, pvalue;
+    int which = ITIMER_REAL;
+    int err;
+
+    sem_init(&g_timer_sem, 0, 0);
+
+    err = pthread_create(&g_timer_thread, NULL, &__timer_thread_main,
+                         NULL);
+    if (err) {
+        hvfs_err(lib, "Create timer thread failed w/ %s\n", strerror(errno));
+        err = -errno;
+        goto out;
+    }
+
+    /* first, let us block the SIGALRM */
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &set, NULL); /* oh, we do not care about the
+                                             * errs */
+
+    memset(&ac, 0, sizeof(ac));
+    sigemptyset(&ac.sa_mask);
+    ac.sa_flags = 0;
+    ac.sa_sigaction = __itimer_default;
+    err = sigaction(SIGALRM, &ac, NULL);
+    if (err) {
+        err = -errno;
+        goto out;
+    }
+    err = getitimer(which, &pvalue);
+    if (err) {
+        err = -errno;
+        goto out;
+    }
+
+    if (interval) {
+        value.it_interval.tv_sec = 1;
+        value.it_interval.tv_usec = 0;
+        value.it_value.tv_sec = 1;
+        value.it_value.tv_usec = 0;
+        err = setitimer(which, &value, &ovalue);
+        if (err) {
+            err = -errno;
+            goto out;
+        }
+        hvfs_debug(lib, "OK, we have created a timer thread to "
+                   " do scans every %d second(s).\n", interval);
+    } else {
+        hvfs_debug(lib, "Hoo, there is no need to setup itimers based on the"
+                   " configration.\n");
+        g_timer_thread_stop = 1;
+    }
+
+    err = getitimer(which, &pvalue);
+    if (err) {
+        err = -errno;
+        goto out;
+    }
+
+out:
+    return err;
+}
+
 int main(int argc, char *argv[]) {
     redisContext *c;
     char *action = NULL, *conf_file = NULL, *data_file = NULL, 
@@ -1228,7 +1504,7 @@ int main(int argc, char *argv[]) {
     int err = 0, is_fork = 0, i, db = 3;
 
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgD:";
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgD:I:";
     struct option longflags[] = {
         {"id", required_argument, 0, 'd'},
         {"round", required_argument, 0, 'r'},
@@ -1241,6 +1517,7 @@ int main(int argc, char *argv[]) {
         {"ipdb", required_argument, 0, 'b'},
         {"ignoreact", required_argument, 0, 'A'},
         {"database", required_argument, 0, 'D'},
+        {"interval", required_argument, 0, 'I'},
         {"isfork", no_argument, 0, 'f'},
         {"local", no_argument, 0, 'l'},
         {"debug", no_argument, 0, 'g'},
@@ -1300,10 +1577,10 @@ int main(int argc, char *argv[]) {
             action = strdup(optarg);
             break;
         case 's':
-            offset = atol(optarg);
+            g_last_offset = offset = atol(optarg);
             break;
         case 'i':
-            data_file = strdup(optarg);
+            g_input = data_file = strdup(optarg);
             break;
         case 'o':
             huadan_file = strdup(optarg);
@@ -1330,6 +1607,9 @@ int main(int argc, char *argv[]) {
         case 'D':
             db = atoi(optarg);
             break;
+        case 'I':
+            g_interval = atoi(optarg);
+            break;
         case 'h':
         case '?':
             do_help();
@@ -1349,7 +1629,7 @@ int main(int argc, char *argv[]) {
     if (log_file) {
         /* close stdout */
         close(1);
-        int fd = open(log_file, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        int fd = open(log_file, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
         if (fd < 0) {
             hvfs_err(lib, "open() failed w/ %s\n", strerror(errno));
             return EINVAL;
@@ -1378,6 +1658,11 @@ int main(int argc, char *argv[]) {
     if (g_id != 0 && g_local) {
         hvfs_warning(lib, "When argument 'local' is set, you have to "
                      "keep client ID to ZERO.\n");
+        return EINVAL;
+    }
+
+    if (setup_timers(g_interval) < 0) {
+        hvfs_err(lib, "Setup timers and thread failed!");
         return EINVAL;
     }
     
@@ -1420,17 +1705,30 @@ int main(int argc, char *argv[]) {
         }
         xg->sites[i].context = c;
     }
+    __update_server_ring(&server_ring, xg);
     hvfs_info(lib, "Server connections has established!\n");
 
-    if (g_action & ACTION_POP_HUADAN || g_action & ACTION_PEEK_HUADAN) {
-        huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
-        if (huadan_fd < 0) {
-            hvfs_err(lib, "open file '%s' failed w/ %s\n",
-                     huadan_file, strerror(errno));
-            return errno;
+    if (g_action & ACTION_LOAD_DATA) {
+        err = check_conflict(data_file, getpid());
+        if (err) {
+            hvfs_err(lib, "Processes conflicts on file %s\n", data_file);
+            return EINVAL;
         }
-        hvfs_info(lib, "Open HUADAN file '%s' in APPEND mode\n", huadan_file);
+    } else if (g_action & (ACTION_PEEK_HUADAN | ACTION_POP_HUADAN)) {
+        err = check_conflict(huadan_file, getpid());
+        if (err) {
+            hvfs_err(lib, "Processes conflicts on file %s\n", huadan_file);
+            return EINVAL;
+        }
     }
+
+    huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+    if (huadan_fd < 0) {
+        hvfs_err(lib, "open file '%s' failed w/ %s\n",
+                 huadan_file, strerror(errno));
+        return errno;
+    }
+    hvfs_info(lib, "Open HUADAN file '%s' in APPEND mode\n", huadan_file);
 
     /* which db should i use? */
     err = use_db(db);
@@ -1462,7 +1760,8 @@ int main(int argc, char *argv[]) {
         hvfs_info(lib, " Server[%ld]: %ld\n", xg->sites[i].site_id, xg->sites[i].nr);
     }
 
-    close(huadan_fd);
+    if (g_action & ACTION_POP_HUADAN)
+        close(huadan_fd);
     fclose(dbfp);
 
     /* update the file length now */
@@ -1493,7 +1792,7 @@ int main(int argc, char *argv[]) {
         } while (bl < sizeof(g_doffset));
         hvfs_info(lib, "Write offset back to parent process done.\n");
     } else if (g_doffset >= 0) {
-        set_file_size(data_file, offset);
+        set_file_size(data_file, g_last_offset);
     }
     
     hvfs_info(lib, "+Success to OFFSET %ld \n"
@@ -1503,6 +1802,9 @@ int main(int argc, char *argv[]) {
               g_doffset,
               process_nr, corrupt_nr, ignore_nr, 
               pop_huadan_nr, poped, flushed, peek_huadan_nr);
+
+    while (1)
+        sleep(1);
     fina_xg(xg);
 
     return 0;

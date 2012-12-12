@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-05 16:59:12 macan>
+ * Time-stamp: <2012-12-11 16:04:24 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,6 +39,7 @@ struct chp
     u64 site_id;
     char *node;
     int port;
+    void *private;
 };
 
 struct chring 
