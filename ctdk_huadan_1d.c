@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-12 21:12:44 macan>
+ * Time-stamp: <2012-12-14 15:20:46 macan>
  *
  */
 
@@ -319,7 +319,7 @@ int new_stream(struct streamid *id, int suffix)
 
     GEN_HASH_KEY(str, id);
     GEN_FULL_KEY(str, id, suffix);
-    hvfs_info(lib, "New -> %s\n", str);
+    hvfs_debug(lib, "New -> %s\n", str);
     
     /* try next stream until 1000 */
     if (suffix >= 1000) {
@@ -910,6 +910,15 @@ int set_file_size(char *pathname, long osize)
         hvfs_plain(lib, "ok.\n");
     }
 
+    /* update the g_doffset */
+    {
+        long __off = ftell(g_dfp);
+
+        if (__off > 0) {
+            g_doffset = __off;
+        }
+    }
+    
     /* use db 0 */
     do {
         redisReply *reply;
@@ -944,7 +953,7 @@ int set_file_size(char *pathname, long osize)
         hvfs_warning(lib, "Someone changed the file length? new(%ld) vs %ld\n",
                      saved, osize);
     }
-    g_last_offset = saved;
+    g_last_offset = g_doffset;
 
     redisFree(c);
 
@@ -1151,7 +1160,7 @@ int process_table(void *data, int cnt, const char **cv)
     char *p, *q;
     int i, EOS = 0, isact = 0, isfrg = 0;
 
-    if (cnt < m->table_cnr) {
+    if (unlikely(cnt < m->table_cnr)) {
         /* ignore this line */
         corrupt_nr++;
         goto update_pos;
@@ -1224,13 +1233,6 @@ int process_table(void *data, int cnt, const char **cv)
 
     /* update the current valid stream offset */
 update_pos:
-    {
-        long __off = ftell(g_dfp);
-
-        if (__off > 0) {
-            g_doffset = __off;
-        }
-    }
 
     return 0;
 }
@@ -1803,8 +1805,6 @@ int main(int argc, char *argv[]) {
               process_nr, corrupt_nr, ignore_nr, 
               pop_huadan_nr, poped, flushed, peek_huadan_nr);
 
-    while (1)
-        sleep(1);
     fina_xg(xg);
 
     return 0;

@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-12 21:01:13 macan>
+ * Time-stamp: <2012-12-14 14:58:59 macan>
  *
  */
 
@@ -678,7 +678,6 @@ int add_job(char *pathname, long offset, struct job_info *ji)
             "-b", ji->ipdb,
             "-A", ignoreactstr,
             "-f",
-            "-g",
             "-D", dbstr,
             NULL,
         };
