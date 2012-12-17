@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-11-23 15:14:30 macan>
+ * Time-stamp: <2012-12-14 16:45:43 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -200,6 +200,48 @@ out:
     return p;
 }
 
+static inline
+struct chp *__ring_get_point2_nolock(u64 point, struct chring *r)
+{
+    s64 highp;
+    s64 lowp = 0, midp;
+    u64 midval, midval1;
+    struct chp *p;
+    
+    if (unlikely(!r || !r->used))
+        return ERR_PTR(-EINVAL);
+
+    highp = r->used;
+
+    while (1) {
+        midp = (lowp + highp) >> 1;
+        if (midp == r->used) {
+            p = &r->array[0];
+            break;
+        }
+
+        midval = r->array[midp].point;
+        midval1 = midp == 0 ? 0 : r->array[midp - 1].point;
+
+        if (point <= midval && point > midval1) {
+            p = &r->array[midp];
+            break;
+        }
+
+        if (midval < point)
+            lowp = midp + 1;
+        else
+            highp = midp - 1;
+
+        if (lowp > highp) {
+            p = &r->array[0];
+            break;
+        }
+    }
+    
+    return p;
+}
+
 struct chp *ring_get_point2(u64 point, struct chring *r)
 {
     return __ring_get_point2(point, r);
@@ -207,7 +249,7 @@ struct chp *ring_get_point2(u64 point, struct chring *r)
 
 struct chp *ring_get_point(char *key, struct chring *r)
 {
-    return ring_get_point2(hvfs_hash(key, strlen(key)), r);
+    return __ring_get_point2_nolock(hvfs_hash(key, strlen(key)), r);
 }
 
 /* ABI: we assume that the rr array has at least topn slots

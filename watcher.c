@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 14:58:59 macan>
+ * Time-stamp: <2012-12-14 17:07:25 macan>
  *
  */
 
@@ -97,7 +97,7 @@ struct job_info
 static struct job_info job_infos[] = {
     {"ctdk_1d_normal", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
      "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s-%d",
-     "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld", "load", 1, 0, 0, 2, 10, 10, 13, 14,},
+     "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld", "load", 0, 0, 0, 2, 10, 10, 13, 14,},
     {"ctdk_1d_pop", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
      "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s",
      "logs/CTDK-CLI-LOG-%s-r%d-c%d-FINAL", "pop", 0, 0, 0, 2, 10, 10, 13, 14,},

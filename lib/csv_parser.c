@@ -98,8 +98,6 @@ static int csv_parse_line (struct csv_parser_data * d)
 	// now buff points to '\n', replace it with a '\0'
 	*buff='\0';
 
-	if (d->callback==NULL) 
-		return 0;
 	return d->callback (d->params, d->field_count, d->column_values);
 
 }
@@ -145,7 +143,7 @@ int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
         /* remove tailing $EOF$\n */
         if ((r = strlen(d.buff)) >= 6) {
             if (strncmp(d.buff + r - 6, "$EOF$", 5) == 0) {
-                d.buff[r - 6] = '\0';
+                d.buff[r - 6] = '\n';
             } else {
                 /* partital line */
                 return E_PARTITAL_LINE;

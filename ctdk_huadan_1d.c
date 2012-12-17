@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 15:20:46 macan>
+ * Time-stamp: <2012-12-14 17:34:33 macan>
  *
  */
 
@@ -206,10 +206,6 @@ redisContext *get_server_from_key(char *key)
     struct chp *p;
     struct xnet_group_entry *e;
 
-    if (unlikely(!xg)) {
-        hvfs_err(lib, "Server group has not been initialized.\n");
-        return NULL;
-    }
     p = ring_get_point(key, &server_ring);
     hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
     e = p->private;
@@ -911,7 +907,7 @@ int set_file_size(char *pathname, long osize)
     }
 
     /* update the g_doffset */
-    {
+    if (g_dfp) {
         long __off = ftell(g_dfp);
 
         if (__off > 0) {
@@ -953,6 +949,8 @@ int set_file_size(char *pathname, long osize)
         hvfs_warning(lib, "Someone changed the file length? new(%ld) vs %ld\n",
                      saved, osize);
     }
+    hvfs_info(lib, "Update file offset to %ld B (%lf MB/s)\n", g_doffset,
+              (double)(g_doffset - g_last_offset) / 1024.0 / 1024.0 / g_interval);
     g_last_offset = g_doffset;
 
     redisFree(c);
@@ -1146,11 +1144,8 @@ out:
     return err;
 }
 
-#define UPDATE_FIELD(stream, iter, idx, name, func, str) do {   \
-        if (iter == idx) {                                      \
-            stream.name = func(str[iter]);                      \
-            continue;                                           \
-        }                                                       \
+#define UPDATE_FIELD(stream, idx, name, func, str) do {         \
+        stream.name = func(str[idx]);                           \
     } while (0)
 
 int process_table(void *data, int cnt, const char **cv)
@@ -1158,54 +1153,52 @@ int process_table(void *data, int cnt, const char **cv)
     struct manager *m = (struct manager *)data;
     struct streamid id = {0,};
     char *p, *q;
-    int i, EOS = 0, isact = 0, isfrg = 0;
+    int EOS = 0, isact = 0, isfrg = 0;
 
     if (unlikely(cnt < m->table_cnr)) {
         /* ignore this line */
         corrupt_nr++;
         goto update_pos;
     }
-    for (i = 0; i < m->table_cnr; i++) {
-        hvfs_debug(lib, "%s = %s\n", m->table_names[i], cv[i]);
-        UPDATE_FIELD(id, i, 1, jlsj, atol, cv);
-        UPDATE_FIELD(id, i, 2, jcsj, atol, cv);
-        UPDATE_FIELD(id, i, 3, cljip, atoi, cv);
-        UPDATE_FIELD(id, i, 5, fwqip, atoi, cv);
-        UPDATE_FIELD(id, i, 6, fwqdk, atoi, cv);
-        UPDATE_FIELD(id, i, 7, khdip, atoi, cv);
-        UPDATE_FIELD(id, i, 8, khddk, atoi, cv);
-        if (i == 9) {
-            /* parse the string */
-            p = (char *)cv[i];
-            do {
-                q = strtok(p, ";,\n");
-                if (!q) {
-                    break;
-                } else if (strcmp(q, "INB") == 0) {
-                    id.direction = STREAM_IN;
-                } else if (strcmp(q, "OUT") == 0) {
-                    id.direction = STREAM_OUT;
-                } else if (strcmp(q, "UDA") == 0) {
-                    id.protocol = STREAM_UDP;
-                } else if (strcmp(q, "TDA") == 0) {
-                    id.protocol = STREAM_TCP;
-                } else if (strcmp(q, "NIL") == 0) {
-                    /* this is the stream end flag, we should POP the
-                     * six-entry tuple from db[0] to db[1] */
-                    EOS = 1;
-                } else if (strcmp(q, "ACT") == 0) {
-                    isact = 1;
-                } else if (strcmp(q, "FRG") == 0) {
-                    isfrg = 1;
-                }
-            } while (p = NULL, 1);
-        }
-        UPDATE_FIELD(id, i, 10, bs, atoi, cv);
-        UPDATE_FIELD(id, i, 11, zjs, atol, cv);
-        UPDATE_FIELD(id, i, 12, gjlx, atoi, cv);
-    }
 
-    if (g_sc.ignoreact) {
+    UPDATE_FIELD(id, 1, jlsj, atol, cv);
+    UPDATE_FIELD(id, 2, jcsj, atol, cv);
+    UPDATE_FIELD(id, 3, cljip, atoi, cv);
+    UPDATE_FIELD(id, 5, fwqip, atoi, cv);
+    UPDATE_FIELD(id, 6, fwqdk, atoi, cv);
+    UPDATE_FIELD(id, 7, khdip, atoi, cv);
+    UPDATE_FIELD(id, 8, khddk, atoi, cv);
+    {
+        /* parse the string */
+        p = (char *)cv[9];
+        do {
+            q = strtok(p, ";,\n");
+            if (!q) {
+                break;
+            } else if (strcmp(q, "INB") == 0) {
+                id.direction = STREAM_IN;
+            } else if (strcmp(q, "OUT") == 0) {
+                id.direction = STREAM_OUT;
+            } else if (strcmp(q, "UDA") == 0) {
+                id.protocol = STREAM_UDP;
+            } else if (strcmp(q, "TDA") == 0) {
+                id.protocol = STREAM_TCP;
+            } else if (strcmp(q, "NIL") == 0) {
+                /* this is the stream end flag, we should POP the
+                 * six-entry tuple from db[0] to db[1] */
+                EOS = 1;
+            } else if (strcmp(q, "ACT") == 0) {
+                isact = 1;
+            } else if (strcmp(q, "FRG") == 0) {
+                isfrg = 1;
+            }
+        } while (p = NULL, 1);
+    }
+    UPDATE_FIELD(id, 10, bs, atoi, cv);
+    UPDATE_FIELD(id, 11, zjs, atol, cv);
+    UPDATE_FIELD(id, 12, gjlx, atoi, cv);
+
+    if (unlikely(g_sc.ignoreact)) {
         if (!id.direction || !id.protocol) {
             /* invalid direction, ignore it */
             ignore_nr++;
@@ -1269,7 +1262,14 @@ int parse_csv_file(char *filepath, long offset)
         break;
     }
     
-    fclose(fp);
+    /* update the g_doffset finally */
+    {
+        long __off = ftell(g_dfp);
+        
+        if (__off > 0) {
+            g_doffset = __off;
+        }
+    }
 
     return offset;
 }
@@ -1797,6 +1797,8 @@ int main(int argc, char *argv[]) {
         set_file_size(data_file, g_last_offset);
     }
     
+    fclose(g_dfp);
+
     hvfs_info(lib, "+Success to OFFSET %ld \n"
               "Stream Line Stat NRs => "
               "Process %ld, Corrupt %ld, Ignore %ld, "

@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-11-23 15:17:49 macan>
+ * Time-stamp: <2012-12-14 17:22:56 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -60,10 +60,11 @@
 #define hvfs_tracing(mask, flag, lvl, f, a...) do {                     \
         if (unlikely(mask & flag)) {                                    \
             struct timeval __cur;                                       \
+            struct tm *__tmp;                                           \
             char __ct[32];                                              \
             gettimeofday(&__cur, NULL);                                 \
-            ctime_r(&__cur.tv_sec, __ct);                               \
-            __ct[strlen(__ct) - 1] = '\0';                              \
+            __tmp = localtime(&__cur.tv_sec);                           \
+            strftime(__ct, 32, "%G-%m-%d %H:%M:%S", __tmp);             \
             if (mask & HVFS_PRECISE) {                                  \
                 PRINTK("%s.%03ld " lvl "HVFS (%16s, %5d): %s[%lx]: " f, \
                        __ct, (long)(__cur.tv_usec / 1000),              \
