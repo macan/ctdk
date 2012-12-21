@@ -4,16 +4,19 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 17:34:33 macan>
+ * Time-stamp: <2012-12-21 09:40:49 macan>
  *
  */
 
 #include "common.h"
 
+HVFS_TRACING_INIT();
+
 struct manager
 {
     u64 client_id;
     int table_cnr;              /* # of columns */
+    int cnr_accept;             /* min # of columns accepted */
     char **table_names;
     char **table_types;
 };
@@ -23,6 +26,7 @@ static struct xnet_group *xg = NULL;
 static struct xnet_group *xg_client = NULL;
 static struct manager m;
 static char *g_input = NULL;
+static char *g_output = NULL;
 static int huadan_fd = -1;
 static FILE *dbfp = NULL;
 static FILE *g_dfp = NULL;
@@ -41,6 +45,9 @@ static long flushed = 0;
 static int g_id = -1;
 static int g_round = -1;
 static int g_local = 0;
+#define OUTPUT_TXT              0x00
+#define OUTPUT_CSV              0x01
+static int g_output_format = OUTPUT_TXT;
 #define ACTION_NOOP             0x00
 #define ACTION_LOAD_DATA        0x01
 #define ACTION_PEEK_HUADAN      0x02
@@ -189,9 +196,51 @@ free:
     return NULL;
 }
 
+char *printHuadanCSV(struct huadan *hd)
+{
+    char address[1000] = {0,}; 
+    char ip2[32];
+    char *str;
+
+    str = malloc(1024);
+    if (!str) {
+        hvfs_err(lib, "malloc() str buffer failed\n");
+        return NULL;
+    }
+    sprintf(ip2, "%d.%d.%d.%d", 
+            (hd->khdip >> 24) & 0xff,
+            (hd->khdip >> 16) & 0xff,
+            (hd->khdip >> 8) & 0xff,
+            hd->khdip & 0xff);
+    ipconv(ip2, address, dbfp);
+    sprintf(str, "\"1\",\"%x\",\"%ld\",\"%ld\",\"%ld\",\"%d\",\"%d\",\"%d\",\"%d\",\"%s\",\"%d\",\"%ld\",\"%d\",\"%ld\",\"%s\"",
+            hd->gjlx,
+            hd->qssj,
+            hd->jssj,
+            hd->cxsj,
+            hd->fwqip,
+            hd->fwqdk,
+            hd->khdip,
+            hd->khddk,
+            (hd->protocol == STREAM_TCP ? "TCP" :
+             (hd->protocol == STREAM_UDP ? "UDP" : "UKN")),
+            hd->out_bs,
+            hd->out_zjs,
+            hd->in_bs,
+            hd->in_zjs,
+            address);
+
+    return str;
+}
+
 char *printHuadanLine(struct huadan *hd)
 {
-    char *str = printHuadan(hd);
+    char *str = NULL;
+
+    if (g_output_format == OUTPUT_TXT)
+        str = printHuadan(hd);
+    else
+        str = printHuadanCSV(hd);
 
     if (str) {
         strcat(str, "\n");
@@ -874,10 +923,11 @@ int use_db(int db)
                     break;
                 }
             }
-            freeReplyObject(reply);
-            hvfs_err(lib, "Select to use Database %d failed\n", db);
+            hvfs_err(lib, "Select to use Database %d on site %s failed: %s\n", 
+                     db, xg->sites[i].node, reply->str);
             
-            return err;
+            freeReplyObject(reply);
+            return EINVAL;
         } while (0);
         freeReplyObject(reply);
     }
@@ -895,7 +945,10 @@ int set_file_size(char *pathname, long osize)
     /* Use 0the server, connect it each time */
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
 
-    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+    if (!pathname)
+        return 0;
+    
+    hvfs_info(lib, "SET: Connect to Server[%ld] %s:%d ... ", 
               xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
     c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
                                 timeout);
@@ -915,18 +968,22 @@ int set_file_size(char *pathname, long osize)
         }
     }
     
-    /* use db 0 */
+    /* default use db 0 */
     do {
         redisReply *reply;
         
         reply = redisCommand(c, "SELECT 0");
         if (reply->type == REDIS_REPLY_STATUS) {
             if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "Select to use Database 0\n");
+                hvfs_info(lib, "SET: Select to use Database 0\n");
+                freeReplyObject(reply);
                 break;
             }
         }
         hvfs_err(lib, "Select to use Database 0 failed!\n");
+        freeReplyObject(reply);
+        redisFree(c);
+
         return err;
     } while (0);
 
@@ -1044,7 +1101,10 @@ int do_HB(char *pathname, pid_t pid)
     /* Use 0the server, connect it each time */
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
 
-    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+    if (!pathname)
+        return 1;
+    
+    hvfs_info(lib, "HB: Connect to Server[%ld] %s:%d ... ", 
               xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
     c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
                                 timeout);
@@ -1062,7 +1122,7 @@ int do_HB(char *pathname, pid_t pid)
         reply = redisCommand(c, "SELECT 0");
         if (reply->type == REDIS_REPLY_STATUS) {
             if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "Select to use Database 0\n");
+                hvfs_info(lib, "HB: Select to use Database 0\n");
                 break;
             }
         }
@@ -1155,22 +1215,22 @@ int process_table(void *data, int cnt, const char **cv)
     char *p, *q;
     int EOS = 0, isact = 0, isfrg = 0;
 
-    if (unlikely(cnt < m->table_cnr)) {
+    if (unlikely(cnt < m->cnr_accept)) {
         /* ignore this line */
         corrupt_nr++;
         goto update_pos;
     }
 
-    UPDATE_FIELD(id, 1, jlsj, atol, cv);
-    UPDATE_FIELD(id, 2, jcsj, atol, cv);
-    UPDATE_FIELD(id, 3, cljip, atoi, cv);
-    UPDATE_FIELD(id, 5, fwqip, atoi, cv);
-    UPDATE_FIELD(id, 6, fwqdk, atoi, cv);
-    UPDATE_FIELD(id, 7, khdip, atoi, cv);
-    UPDATE_FIELD(id, 8, khddk, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(1), jlsj, atol, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(2), jcsj, atol, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(3), cljip, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(5), fwqip, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(6), fwqdk, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(7), khdip, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(8), khddk, atoi, cv);
     {
         /* parse the string */
-        p = (char *)cv[9];
+        p = (char *)cv[LYLX_SHIFT(9)];
         do {
             q = strtok(p, ";,\n");
             if (!q) {
@@ -1194,9 +1254,9 @@ int process_table(void *data, int cnt, const char **cv)
             }
         } while (p = NULL, 1);
     }
-    UPDATE_FIELD(id, 10, bs, atoi, cv);
-    UPDATE_FIELD(id, 11, zjs, atol, cv);
-    UPDATE_FIELD(id, 12, gjlx, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(10), bs, atoi, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(11), zjs, atol, cv);
+    UPDATE_FIELD(id, LYLX_SHIFT(12), gjlx, atoi, cv);
 
     if (unlikely(g_sc.ignoreact)) {
         if (!id.direction || !id.protocol) {
@@ -1422,8 +1482,12 @@ static void *__timer_thread_main(void *arg)
         if (cur - last > g_interval) {
             hvfs_info(lib, ">>>>> Update Offset and HB Info >>>>\n");
             last = cur;
-            set_file_size(g_input, g_last_offset);
-            do_HB(g_input, getpid());
+            if (g_action & ACTION_LOAD_DATA) {
+                set_file_size(g_input, g_last_offset);
+                do_HB(g_input, getpid());
+            } else if (g_action & (ACTION_PEEK_HUADAN | ACTION_POP_HUADAN)) {
+                do_HB(g_output, getpid());
+            }
         }
     }
 
@@ -1502,11 +1566,12 @@ int main(int argc, char *argv[]) {
     redisContext *c;
     char *action = NULL, *conf_file = NULL, *data_file = NULL, 
         *huadan_file = NULL, *log_file = NULL, *ipdb_file = NULL, *value;
+    char hostname[128];
     long offset = 0;
-    int err = 0, is_fork = 0, i, db = 3;
+    int err = 0, is_fork = 0, i, db = 3, mode = 0;
 
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgD:I:";
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:";
     struct option longflags[] = {
         {"id", required_argument, 0, 'd'},
         {"round", required_argument, 0, 'r'},
@@ -1520,17 +1585,25 @@ int main(int argc, char *argv[]) {
         {"ignoreact", required_argument, 0, 'A'},
         {"database", required_argument, 0, 'D'},
         {"interval", required_argument, 0, 'I'},
+        {"mode", required_argument, 0, 'm'},
         {"isfork", no_argument, 0, 'f'},
         {"local", no_argument, 0, 'l'},
         {"debug", no_argument, 0, 'g'},
+        {"csv", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
     };
-    TABLE_DEF(orig_log, 18);
+#ifdef USE_LYLX
+    TABLE_DEF(orig_log, 18, 13);
+#else
+    TABLE_DEF(orig_log, 17, 12);
+#endif
     TABLE_FIELD(orig_log, int, rzlx);
     TABLE_FIELD(orig_log, unsigned long, jlsj);
     TABLE_FIELD(orig_log, unsigned long, jcsj);
     TABLE_FIELD(orig_log, unsigned int, cljip);
+#ifdef USE_LYLX
     TABLE_FIELD(orig_log, unsigned int, lylx);
+#endif
     TABLE_FIELD(orig_log, unsigned int, fwqip);
     TABLE_FIELD(orig_log, unsigned int, fwqdk);
     TABLE_FIELD(orig_log, unsigned int, khdip);
@@ -1547,6 +1620,7 @@ int main(int argc, char *argv[]) {
     m.table_names = TABLE_NAMES(orig_log);
     m.table_types = TABLE_TYPES(orig_log);
     m.table_cnr = TABLE_NR(orig_log);
+    m.cnr_accept = TABLE_NR_ACCEPT(orig_log);
 
     /* get env */
     value = getenv("config");
@@ -1585,13 +1659,16 @@ int main(int argc, char *argv[]) {
             g_input = data_file = strdup(optarg);
             break;
         case 'o':
-            huadan_file = strdup(optarg);
+            g_output = huadan_file = strdup(optarg);
             break;
         case 'x':
             log_file = strdup(optarg);
             break;
         case 'f':
             is_fork = 1;
+            break;
+        case 'm':
+            mode = atoi(optarg); /* != 0 means append, 0 means trunc */
             break;
         case 'c':
             if (conf_file)
@@ -1611,6 +1688,9 @@ int main(int argc, char *argv[]) {
             break;
         case 'I':
             g_interval = atoi(optarg);
+            break;
+        case 'v':
+            g_output_format = OUTPUT_CSV;
             break;
         case 'h':
         case '?':
@@ -1655,6 +1735,20 @@ int main(int argc, char *argv[]) {
     } else if (!data_file || !huadan_file || !conf_file || !ipdb_file) {
         hvfs_err(lib, "Please set input/output/config/ipdb files in ARGV.\n");
         return EINVAL;
+    }
+
+    /* get hostname */
+    err = gethostname(hostname, 128);
+    if (err) {
+        hvfs_err(lib, "gethostname() failed w/ %s\n", strerror(errno));
+        return EINVAL;
+    }
+    if (g_output) {
+        char *tmp = xzalloc(1024);
+        if (!tmp)
+            return ENOMEM;
+        sprintf(tmp, "%s-%s", g_output, hostname);
+        g_output = tmp;
     }
 
     if (g_id != 0 && g_local) {
@@ -1711,26 +1805,33 @@ int main(int argc, char *argv[]) {
     hvfs_info(lib, "Server connections has established!\n");
 
     if (g_action & ACTION_LOAD_DATA) {
-        err = check_conflict(data_file, getpid());
+        err = check_conflict(g_input, getpid());
         if (err) {
             hvfs_err(lib, "Processes conflicts on file %s\n", data_file);
             return EINVAL;
         }
     } else if (g_action & (ACTION_PEEK_HUADAN | ACTION_POP_HUADAN)) {
-        err = check_conflict(huadan_file, getpid());
+        err = check_conflict(g_output, getpid());
         if (err) {
-            hvfs_err(lib, "Processes conflicts on file %s\n", huadan_file);
+            hvfs_err(lib, "Processes conflicts on file %s\n", g_output);
             return EINVAL;
         }
     }
 
-    huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+    if (mode) {
+        /* append mode */
+        huadan_fd = open(huadan_file, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IWUSR);
+    } else {
+        /* trunc mode */
+        huadan_fd = open(huadan_file, O_WRONLY | O_APPEND | O_CREAT, S_IRUSR | S_IWUSR);
+    }
     if (huadan_fd < 0) {
         hvfs_err(lib, "open file '%s' failed w/ %s\n",
                  huadan_file, strerror(errno));
         return errno;
     }
-    hvfs_info(lib, "Open HUADAN file '%s' in APPEND mode\n", huadan_file);
+    hvfs_info(lib, "Open HUADAN file '%s' in %s mode\n", huadan_file, 
+              mode ? "O_APPEND" : "O_TRUNC");
 
     /* which db should i use? */
     err = use_db(db);
@@ -1779,6 +1880,7 @@ int main(int argc, char *argv[]) {
     default:
         g_doffset = -3;
     }
+
     if (is_fork) {
         /* write the g_doffset to stdin */
         int bw, bl = 0;
@@ -1792,12 +1894,22 @@ int main(int argc, char *argv[]) {
             }
             bl += bw;
         } while (bl < sizeof(g_doffset));
-        hvfs_info(lib, "Write offset back to parent process done.\n");
-    } else if (g_doffset >= 0) {
+        hvfs_info(lib, "Write offset %ld back to parent process done.\n",
+                  g_doffset);
+        fsync(0);
+    }
+
+    if (g_doffset >= 0) {
         set_file_size(data_file, g_last_offset);
     }
-    
-    fclose(g_dfp);
+
+    if (g_dfp)
+        fclose(g_dfp);
+
+    /* clean the huadan file */
+    if (!pop_huadan_nr && !peek_huadan_nr) {
+        unlink(huadan_file);
+    }
 
     hvfs_info(lib, "+Success to OFFSET %ld \n"
               "Stream Line Stat NRs => "

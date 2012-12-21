@@ -3,7 +3,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-12-11 13:08:59 macan>
+# Time-stamp: <2012-12-19 14:59:13 macan>
 #
 # This is the mangement script for Pomegranate
 #
@@ -188,6 +188,25 @@ function start_server() {
             #unlink $HVFS_HOME/conf/redis.$id.$port.conf
             echo "Start Redis server $id done."
         done
+    fi
+}
+
+function start_watcher() {
+    WATCH_DIR="/mnt/data1/src-data/tt/tt_ori_log/"
+    WATCH_INTV=10
+    if [ "x$1" == "x" ]; then
+        ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
+        for x in $ipnr; do 
+            ip=`echo $x | awk -F: '{print $1}'`
+            port=`echo $x | awk -F: '{print $3}'`
+            id=`echo $x | awk -F: '{print $2}'`
+            if [ "x$id" == "x0" ]; then
+                WIP=$ip
+                WPORT=$port
+            fi
+            $SSH $UN$ip "cd $HVFS_HOME/; LD_LIBRARY_PATH=$HVFS_HOME/lib ./watcher -r $WIP -p $WPORT -d $WATCH_DIR -i $WATCH_INTV -I $id > $LOG_DIR/watcher.$id.log" > /dev/null &
+        done
+        echo "Start Redis server done."
     fi
 }
 
@@ -393,6 +412,9 @@ if [ "x$1" == "xstart" ]; then
     else
         start_all
     fi
+elif [ "x$1" == "xwatcher" ]; then
+    shift 1
+    start_watcher $@
 elif [ "x$1" == "xstop" ]; then
     if [ "x$2" == "xserver" ]; then
         stop_server $3

@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-11 10:24:08 macan>
+ * Time-stamp: <2012-12-18 11:35:24 macan>
  *
  */
 
@@ -26,9 +26,10 @@
 #include "lib/ring.h"
 #include "lib/csv_parser.h"
 
-#define TABLE_DEF(table, nr) char *__T_##table##_names[nr], \
-        *__T_##table##_types[nr];                           \
-    int __T_##table##_cnt = 0;
+#define TABLE_DEF(table, nr, accept) char *__T_##table##_names[nr], \
+        *__T_##table##_types[nr];                                   \
+    int __T_##table##_cnt = 0;                                      \
+    int __T_##table##_accept = accept;
 
 #define TABLE_FIELD(table, TYPE, VAR) do {                  \
         __T_##table##_names[__T_##table##_cnt] = #VAR;      \
@@ -37,6 +38,7 @@
     } while (0)
 
 #define TABLE_NR(table) (__T_##table##_cnt)
+#define TABLE_NR_ACCEPT(table) (__T_##table##_accept)
 #define TABLE_TYPE(table, i) (__T_##table##_types[i])
 #define TABLE_NAME(table, i) (__T_##table##_names[i])
 #define TABLE_TYPES(table) (__T_##table##_types)
@@ -48,7 +50,12 @@ struct orig_log
     unsigned long jlsj;         /* 1 */
     unsigned long jcsj;         /* 2 */
     unsigned int cljip;         /* 3 */
+#ifdef USE_LYLX
     unsigned int lylx;          /* 4 */
+#define LYLX_SHIFT(nr) (nr)
+#else
+#define LYLX_SHIFT(nr) (nr > 3 ? (nr - 1) : nr)
+#endif
     unsigned int fwqip;         /* 5 */
     unsigned int fwqdk;         /* 6 */
     unsigned int khdip;         /* 7 */

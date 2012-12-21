@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 17:22:56 macan>
+ * Time-stamp: <2012-12-20 10:23:11 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -26,6 +26,7 @@
 
 #include <sys/timeb.h>
 #include <time.h>
+#include "atomic.h"
 
 /* hvfs tracing flags */
 #define HVFS_INFO       0x80000000
@@ -56,15 +57,34 @@
 #define KERN_PLAIN      ""
 #endif
 
+extern atomic_t g_env_prot;
+
+#define HVFS_TRACING_INIT() atomic_t g_env_prot = {.counter = 0,}
+
 #ifdef HVFS_TRACING
 #define hvfs_tracing(mask, flag, lvl, f, a...) do {                     \
         if (unlikely(mask & flag)) {                                    \
             struct timeval __cur;                                       \
-            struct tm *__tmp;                                           \
-            char __ct[32];                                              \
+            struct tm __tmp;                                            \
+            char __ct[64];                                              \
+            int __p;                                                    \
+                                                                        \
+            do {                                                        \
+                __p = atomic_inc_return(&g_env_prot);                   \
+                if (__p > 1) {                                          \
+                    atomic_dec(&g_env_prot);                            \
+                    sched_yield();                                      \
+                } else                                                  \
+                    break;                                              \
+            } while (1);                                                \
             gettimeofday(&__cur, NULL);                                 \
-            __tmp = localtime(&__cur.tv_sec);                           \
-            strftime(__ct, 32, "%G-%m-%d %H:%M:%S", __tmp);             \
+            if (!localtime_r(&__cur.tv_sec, &__tmp)) {                  \
+                PRINTK(KERN_ERR f, ## a);                               \
+                FFLUSH(stdout);                                         \
+                atomic_dec(&g_env_prot);                                \
+                break;                                                  \
+            }                                                           \
+            strftime(__ct, 64, "%G-%m-%d %H:%M:%S", &__tmp);            \
             if (mask & HVFS_PRECISE) {                                  \
                 PRINTK("%s.%03ld " lvl "HVFS (%16s, %5d): %s[%lx]: " f, \
                        __ct, (long)(__cur.tv_usec / 1000),              \
@@ -79,6 +99,7 @@
                        __ct, (long)(__cur.tv_usec / 1000), ## a);       \
                 FFLUSH(stdout);                                         \
             }                                                           \
+            atomic_dec(&g_env_prot);                                    \
         }                                                               \
     } while (0)
 #else

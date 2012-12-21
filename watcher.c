@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 17:07:25 macan>
+ * Time-stamp: <2012-12-20 17:19:27 macan>
  *
  */
 
@@ -24,10 +24,10 @@
 #include <dirent.h>
 #include <libgen.h>
 
+HVFS_TRACING_INIT();
+
 #define EPOLL_QUEUE_LEN         4096
 #define EPOLL_CHECK             64
-
-redisContext *c = NULL;
 
 struct watcher_config
 {
@@ -39,27 +39,43 @@ struct watcher_config g_config = {
     .scan_interval = SCAN_INTERVAL,
 };
 
-extern char **environ;
+static LIST_HEAD(jobs);
 static pthread_t g_timer_thread = 0;
 static pthread_t g_event_thread = 0;
 static pthread_t g_poll_thread = 0;
 static sem_t g_timer_sem;
 static sem_t g_main_sem;
+extern char **environ;
+static char **environ_saved;
+static char *g_dir = NULL;
+static char *server = "127.0.0.1";
+static char hostname[128];
+static xlock_t job_lock;
+static xlock_t g_huadan_lock;
+static long g_huadan = 0;
+static long g_jobid = 0;
+static long g_propose = -1;
+static long g_poped = 0;
+static int g_id = -1;
+static int port = 9087;
+static int g_epfd = 0;
+static int g_current_db = 3;
 static int g_timer_thread_stop = 0;
 static int g_main_thread_stop = 0;
 static int g_poll_thread_stop = 0;
-static char *g_dir = NULL;
 static unsigned int g_flags = 0;
-static LIST_HEAD(jobs);
-static xlock_t job_lock;
-static xlock_t g_huadan_lock;
-static int g_epfd = 0;
-static int g_current_db = 3;
-static long g_huadan = 0;
-static long g_huadan_next = 0;
-static long g_jobid = 0;
+static int g_has_proposed = 0;
+static int g_should_clr = 0;
+static int g_no_propose = 0;
+static int g_mode = 0;
 
 #define NEXT_JOBID() (++g_jobid)
+
+/* defines for g_poped */
+#define G_POPED_NOOP    0x00
+#define G_POPED_LOAD    0x01
+#define G_POPED_POP     0x02
+#define G_POPED_MAX     0x10
 
 struct job_entry
 {
@@ -68,7 +84,8 @@ struct job_entry
     long offset;
     long jobid;
     long date;
-    int fd;
+    pid_t pid;
+    int fd;                     /* 0 for read, 1 for write */
 };
 
 struct job_info
@@ -97,17 +114,18 @@ struct job_info
 static struct job_info job_infos[] = {
     {"ctdk_1d_normal", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
      "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s-%d",
-     "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld", "load", 0, 0, 0, 2, 10, 10, 13, 14,},
+     "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld-jid%ld", "load", 0, 0, 0, 2, 10, 10, 13, 14,},
     {"ctdk_1d_pop", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
      "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s",
-     "logs/CTDK-CLI-LOG-%s-r%d-c%d-FINAL", "pop", 0, 0, 0, 2, 10, 10, 13, 14,},
+     "logs/CTDK-CLI-LOG-%s-r%d-c%d-FINAL-jid%ld", "pop", 0, 0, 0, 2, 10, 10, 13, 14,},
 };
+static struct job_info *g_sort_ji = NULL;
 #define JI_1D_NORMAL    0
 #define JI_1D_POP       1
 
-int add_job(char *pathname, long offset, struct job_info *ji);
+int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji);
 struct job_entry *del_job(int fd);
-void fina_job(struct job_entry *job);
+void fina_job(redisContext *c, struct job_entry *job);
 int watcher_poll_add(int fd);
 int watcher_poll_del(int fd);
 
@@ -333,7 +351,7 @@ out:
     return fga;
 }
 
-int file_changed(struct file_info *fi)
+int file_changed(redisContext *c, struct file_info *fi)
 {
     redisReply *reply;
     long size = 0;
@@ -357,7 +375,7 @@ int file_changed(struct file_info *fi)
         return 0;
 }
 
-int set_file_size(char *pathname, long size)
+int set_file_size(redisContext *c, char *pathname, long size)
 {
     redisReply *reply;
     long saved = size;
@@ -386,7 +404,207 @@ redo:
     return err;
 }
 
-void do_scan(time_t cur)
+void clr_file_size(redisContext *c, char *pathname)
+{
+    redisReply *reply;
+
+    reply = redisCommand(c, "DEL FS:%s", pathname);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        hvfs_info(lib, "DEL FS:%s\n", pathname);
+    } else {
+        hvfs_warning(lib, "DEL FS:%s, Not an integer reply? del failed %s\n",
+                     pathname, reply->str);
+    }
+    freeReplyObject(reply);
+}
+
+void set_huadan_next(redisContext *c, long next)
+{
+    redisReply *reply;
+
+    g_has_proposed = 1;
+    
+    reply = redisCommand(c, "HSET HUADAN_NEXT %s %ld", hostname, next);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        /* either 0 or 1 is ok */
+        hvfs_info(lib, "HSET HUADAN_NEXT for %s to %ld\n", hostname, next);
+    } else {
+        hvfs_warning(lib, "HSET HUADAN_NEXT not a integer reply?\n");
+    }
+    freeReplyObject(reply);
+}
+
+void clr_huadan_next(redisContext *c)
+{
+    redisReply *reply;
+
+    reply = redisCommand(c, "HDEL HUADAN_NEXT %s", hostname);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        /* either 0 or 1 is ok */
+        hvfs_info(lib, "HDEL HUADAN_NEXT for %s\n", hostname);
+    } else {
+        hvfs_warning(lib, "HDEL HUADAN_NEXT field not a integer reply?\n");
+    }
+    freeReplyObject(reply);
+}
+
+static int __fg_compare(const void *a, const void *b)
+{
+    const struct file_info *fia = a, *fib = b;
+    long al = 0, bl = 0;
+    char *p, *q, *str;
+    int nr = 0;
+
+    str = strdup(fia->pathname);
+    p = basename(str);
+    do {
+        q = strtok(p, "-_\n");
+        if (!q) {
+            break;
+        }
+        nr++;
+        if (nr == g_sort_ji->DATE_COL) {
+            al = atol(q);
+            break;
+        }
+    } while (p = NULL, 1);
+    xfree(str);
+
+    str = strdup(fib->pathname);
+    p = basename(str);
+    nr = 0;
+    do {
+        q = strtok(p, "-_\n");
+        if (!q) {
+            break;
+        }
+        nr++;
+        if (nr == g_sort_ji->DATE_COL) {
+            bl = atol(q);
+            break;
+        }
+    } while (p = NULL, 1);
+    xfree(str);
+
+    return (al < bl ? -1 : (al > bl ? 1 : 0));
+}
+
+void __sort_files(struct file_gather_all *fga, struct job_info *ji)
+{
+    /* setup global gi */
+    g_sort_ji = ji;
+    
+    qsort(fga->add.fis, fga->add.asize, sizeof(struct file_info),
+          __fg_compare);
+}
+
+int check_or_add_to_ignore(redisContext *c, char *pathname) 
+{
+    redisReply *reply;
+    int e = 0;
+
+    reply = redisCommand(c, "SISMEMBER IGNORE_SET FS:%s", pathname);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        if (reply->integer == 1) {
+            e = 1;
+            goto out;
+        }
+    } else {
+        hvfs_err(lib, "SISMEMBER not an integer reply?\n");
+    }
+    freeReplyObject(reply);
+
+    reply = redisCommand(c, "SADD IGNORE_SET FS:%s", pathname);
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        /* it is ok */
+        ;
+    } else {
+        hvfs_err(lib, "SADD not an integer reply?\n");
+    }
+    
+out:
+    freeReplyObject(reply);
+    
+    return e;
+}
+
+static int can_scheduled(redisContext *c, struct file_info *fi, struct job_info *ji)
+{
+    char *p, *q, *str, *day;
+    struct job_entry *pos;
+    long today;
+    int nr = 0, r = 1;
+
+    str = strdup(fi->pathname);
+    p = basename(str);
+    do {
+        q = strtok(p, "-_\n");
+        if (!q) {
+            break;
+        }
+        nr++;
+        if (nr == ji->DATE_COL) {
+            day = strdup(q);
+            break;
+        }
+    } while (p = NULL, 1);
+
+    day[strlen(day) - 2] = '\0';
+    today = atol(day);
+
+    /* check if we can schedule jobs */
+    xlock_lock(&g_huadan_lock);
+    if (!g_huadan) {
+        /* init */
+        r = 0;
+        g_huadan = -1;
+        set_huadan_next(c, atol(day));
+        xlock_unlock(&g_huadan_lock);
+        goto out;
+    } else if (g_huadan < 0) {
+        /* reject */
+        r = 0;
+        xlock_unlock(&g_huadan_lock);
+        goto out;
+    } else if (g_huadan != today) {
+        /* reject, and gather propose info */
+        r = 0;
+        xlock_unlock(&g_huadan_lock);
+        if (today > g_huadan) {
+            if (g_propose < 0)
+                g_propose = today;
+            if (g_propose > today)
+                g_propose = today;
+        } else {
+            /* ignore set management */
+            if (!check_or_add_to_ignore(c, fi->pathname)) {
+                hvfs_warning(lib, "FILE %s changed, but the HUADAN had been poped. "
+                             "CUR(%ld)\n",
+                             fi->pathname, g_huadan);
+            }
+        }
+        goto out;
+    }
+    xlock_unlock(&g_huadan_lock);
+
+    /* check if there are pending load jobs for last day */
+    xlock_lock(&job_lock);
+    list_for_each_entry(pos, &jobs, list) {
+        /* if it is a load job, and not completed, then do not schedule */
+        if (pos->date < today && pos->offset >= 0) {
+            r = 0;
+            break;
+        }
+    }
+    xlock_unlock(&job_lock);
+
+out:
+    xfree(str);
+    
+    return r;
+}
+
+void do_scan(redisContext *c, time_t cur)
 {
     static time_t last_ts = 0;
     static int last_interval;
@@ -409,16 +627,45 @@ void do_scan(time_t cur)
             return;
         }
 
+        /* we should sort the files to arrange job on time order! */
+        __sort_files(fga, &job_infos[JI_1D_NORMAL]);
+        
         for (i = 0; i < fga->add.asize; i++) {
             hvfs_debug(lib, "FILE %s SIZE %ld -> %ld\n",
                        fga->add.fis[i].pathname, fga->add.fis[i].osize, 
                        fga->add.fis[i].size);
-            if (file_changed(&fga->add.fis[i])) {
-                hvfs_info(lib, "FILE %s changed.\n", fga->add.fis[i].pathname);
-                add_job(fga->add.fis[i].pathname, fga->add.fis[i].osize,
-                        &job_infos[JI_1D_NORMAL]);
+            if (file_changed(c, &fga->add.fis[i])) {
+                if (can_scheduled(c, &fga->add.fis[i], &job_infos[JI_1D_NORMAL])) {
+                    hvfs_info(lib, "FILE %s changed.\n", fga->add.fis[i].pathname);
+                    add_job(c, fga->add.fis[i].pathname, fga->add.fis[i].osize,
+                            &job_infos[JI_1D_NORMAL]);
+                } else {
+                    hvfs_debug(lib, "FILE %s changed, and delayed.\n",
+                               fga->add.fis[i].pathname);
+                }
             }
         }
+        if (g_poped == G_POPED_NOOP)
+            g_poped = G_POPED_LOAD;
+        
+        /* if g_propose is large than 0, then try to update next propose */
+        if (g_propose > g_huadan) {
+            int do_update = 1;
+            
+            xlock_lock(&job_lock);
+            if (g_no_propose || (g_poped == G_POPED_LOAD && !list_empty(&jobs))) {
+                /* some jobs are running, do not update next propose */
+                do_update = 0;
+                if (g_no_propose) 
+                    g_no_propose = 0;
+            }
+            xlock_unlock(&job_lock);
+            if (do_update) {
+                set_huadan_next(c, g_propose);
+            }
+            g_propose = -1;
+        }
+        
         if (fga) {
             __free_fg(&fga->add);
             __free_fg(&fga->rmv);
@@ -547,9 +794,26 @@ int do_fork(struct job_entry *job, char *cmd, char *argv[])
         }
         exit(-1);
     } else {
-        /* self process */
-        close(pipefd[1]);
+        /* do not close the write end to eliminate read(2) EOF */
         job->fd = pipefd[0];
+        close(pipefd[1]);
+        job->pid = pid;
+
+        /* self process */
+        {
+            /* change env carefully */
+            int __p;
+
+        retry:
+            __p = atomic_inc_return(&g_env_prot);
+            if (__p > 1) {
+                atomic_dec(&g_env_prot);
+                sched_yield();
+                goto retry;
+            }
+            environ = environ_saved;
+            atomic_dec(&g_env_prot);
+        }        
     }
 out:
     return err;
@@ -559,22 +823,102 @@ out_close:
     goto out;
 }
 
-void set_huadan_date(char *date);
-int toggle_db(int flag);
+void set_huadan_date(redisContext *c, char *date);
+int toggle_db(redisContext *c, int flag);
+char *get_huadan_date(redisContext *c);
+int update_db(redisContext *c);
+
+int propose_or_update_huadan(redisContext *c)
+{
+    redisReply *reply;
+    int r = 0;
+
+    reply = redisCommand(c, "HGETALL HUADAN_NEXT");
+
+    if (g_id == 0) {
+        /* try to peek a valid HUADAN */
+        int i;
+        long proposed_huadan = -1;
+
+        for (i = 0; i < reply->elements; i += 2) {
+            if (proposed_huadan < 0) {
+                proposed_huadan = atol(reply->element[i + 1]->str);
+            }
+            if (proposed_huadan > atol(reply->element[i + 1]->str)) {
+                proposed_huadan = atol(reply->element[i + 1]->str);
+            }
+        }
+
+        if (proposed_huadan > g_huadan) {
+            if (g_huadan < proposed_huadan) {
+                char date[32];
+                int err;
+
+                sprintf(date, "%ld", proposed_huadan);
+                xlock_lock(&g_huadan_lock);
+                err = toggle_db(c, TOGGLE_DB_FLIP);
+                if (err) {
+                    hvfs_err(lib, "FLIP DB from %d failed w/ %d\n",
+                             g_current_db, err);
+                }
+                set_huadan_date(c, date);
+                g_poped = g_huadan;
+                g_huadan = proposed_huadan;
+                xlock_unlock(&g_huadan_lock);
+
+                hvfs_info(lib, "Propose to use HUADAN %s\n", date);
+
+                if (g_poped > 0 && !g_has_proposed) {
+                    /* there are no file changes from we start */
+                    set_huadan_next(c, g_huadan);
+                    g_has_proposed = 0;
+                    g_should_clr = 1;
+                }
+            }
+        }
+    } else {
+        /* try to update a new HUADAN */
+        char *p = get_huadan_date(c);
+        long got_huadan = -1;
+
+        if (p)
+            got_huadan = atol(p);
+        xfree(p);
+
+        /* update the db now */
+        if (got_huadan > g_huadan) {
+            g_poped = g_huadan;
+            g_huadan = got_huadan;
+            hvfs_info(lib, "Got active HUADAN %ld\n", g_huadan);
+            update_db(c);
+
+            if (g_poped > 0 && !g_has_proposed) {
+                /* there are no file changes from we start */
+                set_huadan_next(c, g_huadan);
+                g_has_proposed = 0;
+                g_should_clr = 1;
+            }
+        }
+    }
+
+    freeReplyObject(reply);
+    
+    return r;
+}
 
 /* pathname as:
  * /mnt/data1/src-data/tt/tt_ori_log/TT-ORI-LOG-LOAD1_TT_TT_ORI_LOG_datanode6_2012120606_tt-lq-reg1_4
  */
-int add_job(char *pathname, long offset, struct job_info *ji)
+int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
 {
     char log[PATH_MAX];
-    char output[1024], args[1024];
-    char *filename, *p, *q, *date, *day;
+    char output[PATH_MAX], args[1500];
+    char *p, *q, *date, *day, *str;
     struct job_entry *pos;
-    int nr = 0, rid = 0, cid = 0, found = 0, use_db;
-    
-    filename = basename(strdup(pathname));
-    p = filename;
+    int nr = 0, rid = 0, cid = 0, found = 0, use_db, r = 0;
+
+    str = strdup(pathname);
+    p = basename(str);
     do {
         q = strtok(p, "-_\n");
         if (!q) {
@@ -615,7 +959,8 @@ int add_job(char *pathname, long offset, struct job_info *ji)
         if (!pos) {
             hvfs_err(lib, "xzalloc job entry failed\n");
             xlock_unlock(&job_lock);
-            return -1;
+            r = -1;
+            goto out;
         }
         pos->filename = strdup(pathname);
         pos->offset = offset;
@@ -625,33 +970,27 @@ int add_job(char *pathname, long offset, struct job_info *ji)
     }
     xlock_unlock(&job_lock);
     if (found)
-        return 0;
+        goto out;
 
-    hvfs_info(lib, "Add a new JOB %ld for file %s offset %ld\n", 
-              pos->jobid, pathname, offset);
-    
     /* update the huadan id */
     xlock_lock(&g_huadan_lock);
-    if (!g_huadan) {
-        g_huadan = atol(day);
-        set_huadan_date(day);
-        use_db = g_current_db;
-    } else if (g_huadan == atol(day)) {
+    if (g_huadan == atol(day)) {
         /* the same hudan */
         use_db = g_current_db;
     } else {
-        /* different huadan, flip the DB */
-        g_huadan_next = atol(day);
-        use_db = g_current_db == 1 ? 2 : 1;
+        HVFS_BUGON("Invalid JOB scheduling");
     }
     xlock_unlock(&g_huadan_lock);
     
+    hvfs_info(lib, "Add a new JOB %ld for file %s offset %ld\n", 
+              pos->jobid, pathname, offset);
+    
     sprintf(output, ji->output, date, cid);
-    sprintf(log, ji->log, date, rid, cid, offset);
+    sprintf(log, ji->log, date, rid, cid, offset, pos->jobid);
 
-    sprintf(args, "-a %s -r %d -d %d -s %ld -i %s -o %s -x %s -f -c %s -b %s -A %d",
+    sprintf(args, "-a %s -r %d -d %d -s %ld -i %s -o %s -x %s -f -c %s -b %s -A %d -D %d.",
             ji->action, rid, cid, offset, pathname, output, log,
-            ji->config, ji->ipdb, ji->ignoreact);
+            ji->config, ji->ipdb, ji->ignoreact, use_db);
     hvfs_info(lib, "Start JOB: %s %s\n", ji->cmd, args);
 
     /* use fork to start job */
@@ -685,7 +1024,22 @@ int add_job(char *pathname, long offset, struct job_info *ji)
             ji->env,
             NULL,
         };
-        environ = envp;
+
+        {
+            /* change env carefully */
+            int __p;
+
+        retry:
+            __p = atomic_inc_return(&g_env_prot);
+            if (__p > 1) {
+                atomic_dec(&g_env_prot);
+                sched_yield();
+                goto retry;
+            }
+            environ_saved = environ;
+            environ = envp;
+            atomic_dec(&g_env_prot);
+        }
 
         do_fork(pos, ji->cmd, argv);
         int err = watcher_poll_add(pos->fd);
@@ -693,7 +1047,7 @@ int add_job(char *pathname, long offset, struct job_info *ji)
             hvfs_err(lib, "add JOB fd %d to poll set failed w/ %d\n",
                      pos->fd, err);
             hvfs_warning(lib, "Failure push us to slow mode, wait for this JOB\n");
-            fina_job(pos);
+            fina_job(c, pos);
         }
     }
     /* add the cid and rid to JI array */
@@ -702,10 +1056,18 @@ int add_job(char *pathname, long offset, struct job_info *ji)
     if ((ji + 1)->cid <= cid)
         (ji + 1)->cid = cid;
 
-    return 0;
+    /* change g_poped state */
+    if (g_poped < G_POPED_MAX)
+        g_poped = G_POPED_LOAD;
+    
+    /* free str */
+out:
+    xfree(str);
+    
+    return r;
 }
 
-int add_pop_job(char *date, struct job_info *ji)
+int add_pop_job(redisContext *c, char *date, struct job_info *ji)
 {
     char output[PATH_MAX], log[PATH_MAX];
     struct job_entry *pos;
@@ -742,18 +1104,21 @@ int add_pop_job(char *date, struct job_info *ji)
         return 0;
 
     sprintf(output, ji->output, date);
-    sprintf(log, ji->log, date, ji->rid, ji->cid + 1);
+    sprintf(log, ji->log, date, ji->rid, ji->cid + 1, pos->jobid);
     hvfs_info(lib, "Add a new POP JOB id %ld for time %s\n", 
               pos->jobid, date);
 
     /* use fork to start job */
     {
-        char ridstr[16], cidstr[16], dbstr[16];
+        char ridstr[16], cidstr[16], dbstr[16], modestr[16];
 
         sprintf(ridstr, "%d", ji->rid);
         sprintf(cidstr, "%d", 0); /* reset cid to ZERO! */
-        sprintf(dbstr, "%d", g_current_db);
-        
+        sprintf(dbstr, "%d", g_current_db == 1 ? 2 : 1);
+        sprintf(modestr, "%d", g_mode);
+        if (g_mode)
+            g_mode = 0;
+
         char *argv[] = {
             ji->cmd,
             "-a", ji->action,
@@ -766,6 +1131,7 @@ int add_pop_job(char *date, struct job_info *ji)
             "-f",
             "-l",
             "-D", dbstr,
+            "-m", modestr,
             NULL,
         };
         char *envp[] = {
@@ -774,7 +1140,22 @@ int add_pop_job(char *date, struct job_info *ji)
         };
         int err = 0;
         
-        environ = envp;
+        {
+            /* change env carefully */
+            int __p;
+
+        retry:
+            __p = atomic_inc_return(&g_env_prot);
+            if (__p > 1) {
+                atomic_dec(&g_env_prot);
+                sched_yield();
+                goto retry;
+            }
+            environ_saved = environ;
+            environ = envp;
+            atomic_dec(&g_env_prot);
+        }
+
         hvfs_info(lib, "CMD: -a %s -r %s -d %s -o %s -x %s -D %s\n",
                   ji->action, ridstr, cidstr, output, log, dbstr);
 
@@ -784,9 +1165,13 @@ int add_pop_job(char *date, struct job_info *ji)
             hvfs_err(lib, "add POP JOB fd %d to poll set failed w/ %d\n",
                      pos->fd, err);
             hvfs_warning(lib, "Failure push us to slow mode, wait for this JOB\n");
-            fina_job(pos);
+            fina_job(c, pos);
         }
     }
+    /* FIXME: reset JI info */
+    g_poped = G_POPED_POP;
+    job_infos[JI_1D_POP].rid = 0;
+    job_infos[JI_1D_POP].cid = 0;
 
     return 0;
 }
@@ -807,7 +1192,7 @@ struct job_entry *del_job(int fd)
     return tpos;
 }
 
-void fina_job(struct job_entry *job)
+void fina_job(redisContext *c, struct job_entry *job)
 {
     long offset;
     int br, bl = 0;
@@ -828,35 +1213,37 @@ void fina_job(struct job_entry *job)
     if (bl == sizeof(offset)) {
         if (offset >= 0) {
             hvfs_info(lib, "Update DB: %s -> %ld\n", job->filename, offset);
-            set_file_size(job->filename, offset);
         } else if (offset == -1) {
-            /* pop, so toggle the db change */
-            char date[32];
-            int err;
-
-            sprintf(date, "%ld", g_huadan_next);
-            xlock_lock(&g_huadan_lock);
-            set_huadan_date(date);
-            g_huadan = g_huadan_next;
-
-            err = toggle_db(TOGGLE_DB_FLIP);
-            if (err) {
-                hvfs_err(lib, "FLIP DB from %d failed w/ %d\n",
-                         g_current_db, err);
-
+            if (g_should_clr) {
+                clr_huadan_next(c);
+                g_should_clr = 0;
             }
-            xlock_unlock(&g_huadan_lock);
+
             hvfs_info(lib, "POP Job %ld OK.\n", job->jobid);
         } else if (offset == -2) {
             /* peek */
             hvfs_info(lib, "PEEK Job %ld OK.\n", job->jobid);
+        } else if (offset == -3) {
+            hvfs_info(lib, "Job %ld Terminated, need restart\n", job->jobid);
         }
     } else {
-        hvfs_warning(lib, "JOB for file %s return ZERO offset buffer, "
-                     "you should check it!\n",
-                     job->filename);
+        hvfs_warning(lib, "JOB %ld for file %s return ZERO(%d) offset buffer, "
+                     "you should check it!\n", 
+                     job->jobid, job->filename, bl);
+        /* we should recheck this job: if it is a normal job => do not propose
+         * next HUADAN; if it is a pop job => restart this POP job in append
+         * mode */
+        if (job->offset == -1) {
+            g_no_propose = 1;
+            g_poped = job->date;
+            g_mode = 1;
+        } else {
+            g_no_propose = 1;
+        }
     }
-    
+
+    /* wait4 the child thread */
+    waitpid(job->pid, NULL, 0);
     close(job->fd);
     xfree(job->filename);
     xfree(job);
@@ -928,8 +1315,17 @@ int watcher_poll_wait(struct epoll_event *ev, int timeout)
 static void *__poll_thread_main(void *arg)
 {
     struct epoll_event ev[EPOLL_CHECK];
+    redisContext *c = NULL;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
     sigset_t set;
     int nfds, i;
+
+    hvfs_debug(lib, "Connect to Server %s:%d ... ", server, port);
+    c = redisConnectWithTimeout(server, port, timeout);
+    if (c->err) {
+        hvfs_err(lib, "Connect failed w/ %d\n", c->err);
+        return NULL;
+    }
 
     /* first, let us block the SIGALRM */
     sigemptyset(&set);
@@ -952,16 +1348,20 @@ static void *__poll_thread_main(void *arg)
             if (err) {
                 hvfs_err(lib, "delete fd %d from poll set failed w/ %d\n",
                          fd, err);
+            } else {
+                /* iterate over the job list to find the job_entry */
+                struct job_entry *job = del_job(fd);
+                
+                if (!job) {
+                    hvfs_err(lib, "find job by fd %d failed, no such job!\n", fd);
+                    continue;
+                }
+                /* FIXME: race with del_job */
+                if (ev[i].events & EPOLLHUP) {
+                    g_no_propose = 1;
+                }
+                fina_job(c, job);
             }
-
-            /* iterate over the job list to find the job_entry */
-            struct job_entry *job = del_job(fd);
-
-            if (!job) {
-                hvfs_err(lib, "find job by fd %d failed, no such job!\n", fd);
-                continue;
-            }
-            fina_job(job);
         }
     } while (!g_poll_thread_stop);
     
@@ -972,11 +1372,18 @@ static void *__poll_thread_main(void *arg)
 static void *__event_thread_main(void *arg)
 {
     char path[PATH_MAX];
+    redisContext *c = NULL;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
     struct inotify_event *ie;
     sigset_t set;
     int err;
 
-    hvfs_debug(lib, "I am running...\n");
+    hvfs_debug(lib, "Connect to Server %s:%d ... ", server, port);
+    c = redisConnectWithTimeout(server, port, timeout);
+    if (c->err) {
+        hvfs_err(lib, "Connect failed w/ %d\n", c->err);
+        return NULL;
+    }
 
     /* first, let us block the SIGALRM */
     sigemptyset(&set);
@@ -999,13 +1406,14 @@ static void *__event_thread_main(void *arg)
                     /* add this directory to watch list */
                     hvfs_info(lib, "add %s to watch list\n", path);
                     err = inotifytools_watch_file(path, 
-                                                  IN_CLOSE_WRITE | IN_CREATE | g_flags);
+                                                  IN_CLOSE_WRITE | IN_CREATE | IN_DELETE 
+                                                  | g_flags);
                     if (!err) {
                         hvfs_err(lib, "add %s to watch list failed w/ %d\n",
                                  path, inotifytools_error());
                     }
                 } else {
-                    err = set_file_size(path, 0);
+                    err = set_file_size(c, path, 0);
                     if (err) {
                         hvfs_err(lib, "set file %s size to 0 failed w/ %d\n",
                                  path, err);
@@ -1026,12 +1434,17 @@ static void *__event_thread_main(void *arg)
                              path, strerror(errno));
                 } else {
                     fi.size = buf.st_size;
-                    if (file_changed(&fi)) {
-                        hvfs_info(lib, "FILE %s changed.\n", fi.pathname);
-                        add_job(fi.pathname, fi.osize,
-                                &job_infos[JI_1D_NORMAL]);
+                    if (file_changed(c, &fi)) {
+                        hvfs_info(lib, "FILE %s closed.\n", fi.pathname);
+                        if (can_scheduled(c, &fi, &job_infos[JI_1D_NORMAL])) {
+                            add_job(c, fi.pathname, fi.osize,
+                                    &job_infos[JI_1D_NORMAL]);
+                        }
                     }
                 }
+            } else if (ie->mask & IN_DELETE) {
+                hvfs_info(lib, "file %s deleted\n", path);
+                clr_file_size(c, path);
             } else if (ie->mask & IN_MODIFY) {
                 /* do file update NOW */
                 hvfs_info(lib, "file %s modified\n", path);
@@ -1044,23 +1457,32 @@ static void *__event_thread_main(void *arg)
     pthread_exit(0);
 }
 
-int toggle_db(int flag);
-
-int is_day_start(time_t cur)
+int is_day_start(redisContext *c, time_t cur)
 {
-    if (g_huadan < g_huadan_next) {
-        return 1;
-    } else
-        return 0;
+    int r = 0;
+    
+    /* check localy */
+    if (g_poped > G_POPED_MAX) {
+        r = 1;
+    }
+
+    return r;
 }
 
 static void *__timer_thread_main(void *arg)
 {
+    redisContext *c = NULL;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
     sigset_t set;
     time_t cur;
     int err;
 
-    hvfs_debug(lib, "I am running...\n");
+    hvfs_debug(lib, "Connect to Server %s:%d ... ", server, port);
+    c = redisConnectWithTimeout(server, port, timeout);
+    if (c->err) {
+        hvfs_err(lib, "Connect failed w/ %d\n", c->err);
+        return NULL;
+    }
 
     /* first, let us block the SIGALRM */
     sigemptyset(&set);
@@ -1077,16 +1499,17 @@ static void *__timer_thread_main(void *arg)
         }
 
         cur = time(NULL);
-        /* should we work now */
-        do_scan(cur);
+        /* scan dir: reset g_poped to LOAD */
+        do_scan(c, cur);
         /* should we trigger a stream pop */
-        if (is_day_start(cur)) {
+        if (is_day_start(c, cur)) {
             char date[128];
 
-            sprintf(date, "%ld", g_huadan);
-            add_pop_job(date, &job_infos[JI_1D_POP]);
-
+            sprintf(date, "%ld", g_poped);
+            add_pop_job(c, date, &job_infos[JI_1D_POP]);
         }
+        /* update HUADAN: set g_poped to ACTIVE_HUADAN in need */
+        propose_or_update_huadan(c);
     }
 
     hvfs_debug(lib, "Hooo, I am exiting...\n");
@@ -1169,7 +1592,8 @@ int setup_inotify(char *top_dir)
 
     if (!inotifytools_initialize() ||
         !inotifytools_watch_recursively(full_dir, 
-                                        g_flags | IN_CLOSE_WRITE | IN_CREATE)) {
+                                        g_flags | IN_CLOSE_WRITE | IN_CREATE |
+                                        IN_DELETE)) {
         err = inotifytools_error();
         hvfs_err(lib, "watch dir %s failed w/ %s\n", full_dir, strerror(err));
         goto out;
@@ -1210,20 +1634,34 @@ out:
     return err;
 }
 
-void set_huadan_date(char *date)
+void set_huadan_date(redisContext *c, char *date)
 {
     redisReply *reply;
     
+    /* Step 1: get the current active huadan */
+    reply = redisCommand(c, "GET HUADAN");
+    if (reply->type == REDIS_REPLY_STRING) {
+        if (strcmp(date, reply->str) == 0) {
+            goto free;
+        } else {
+            hvfs_warning(lib, "Try to update HUADAN from %s to %s\n",
+                         reply->str, date);
+        }
+    }
+    freeReplyObject(reply);
+
+    /* Step 2: if needed, update the HUADAN */
     reply = redisCommand(c, "SET HUADAN %s", date);
     if (reply->type == REDIS_REPLY_STATUS) {
         if (strcmp(reply->str, "OK") == 0) {
             hvfs_info(lib, "Set HUADAN to %s\n", date);
         }
     }
+free:
     freeReplyObject(reply);
 }
 
-char *get_huadan_date()
+char *get_huadan_date(redisContext *c)
 {
     redisReply *reply;
     char *date = NULL;
@@ -1237,17 +1675,42 @@ char *get_huadan_date()
         hvfs_err(lib, "get current db failed? %s\n", reply->str);
     }
     freeReplyObject(reply);
-    hvfs_info(lib, "Got active HUADAN %s\n", date);
 
     return date;
 }
 
-int toggle_db(int flag)
+int update_db(redisContext *c)
 {
     redisReply *reply;
-    int err = 0, db = 0;
+    int err = 0, db;
 
     /* get current db */
+    db = 0;
+    reply = redisCommand(c, "GET DB:current");
+    if (reply->type == REDIS_REPLY_NIL) {
+        hvfs_info(lib, "Init Job to use DB 1\n");
+    } else if (reply->type == REDIS_REPLY_STRING) {
+        if (reply->str)
+            db = atoi(reply->str);
+    } else {
+        hvfs_err(lib, "get current db failed? %s\n", reply->str);
+        err = -EINVAL;
+    }
+    freeReplyObject(reply);
+    hvfs_info(lib, "Change current DB from %d to %d\n", g_current_db, db);
+    g_current_db = db;
+
+    return err;
+}
+
+int toggle_db(redisContext *c, int flag)
+{
+    redisReply *reply;
+    int err = 0, db;
+
+retry:
+    /* get current db */
+    db = 0;
     reply = redisCommand(c, "GET DB:current");
     if (reply->type == REDIS_REPLY_NIL) {
         hvfs_info(lib, "Init Job to use DB 1\n");
@@ -1267,6 +1730,24 @@ int toggle_db(int flag)
     case TOGGLE_DB_INIT:
         if (db == 0)
             db = 1;
+        else
+            goto local_change;
+        do {
+            reply = redisCommand(c, "SETNX DB:current %d", db);
+            if (reply->type == REDIS_REPLY_INTEGER) {
+                if (reply->integer == 0) {
+                    /* key conflict, retry */
+                    freeReplyObject(reply);
+                    goto retry;
+                } else {
+                    hvfs_info(lib, "Set Job to use Database %d\n", db);
+                    break;
+                }
+            }
+            freeReplyObject(reply);
+            hvfs_err(lib, "Set Job to use Database %d failed\n", db);
+            return err;
+        } while (0);
         break;
     case TOGGLE_DB_FLIP:
     default:
@@ -1276,21 +1757,22 @@ int toggle_db(int flag)
             db = 2;
         else
             db = 1;
-    }
-    do {
-        reply = redisCommand(c, "SET DB:current %d", db);
-        if (reply->type == REDIS_REPLY_STATUS) {
-            if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "Set Job to use Database %d\n", db);
-                break;
+        do {
+            reply = redisCommand(c, "SET DB:current %d", db);
+            if (reply->type == REDIS_REPLY_STATUS) {
+                if (strcmp(reply->str, "OK") == 0) {
+                    hvfs_info(lib, "Set Job to use Database %d\n", db);
+                    break;
+                }
             }
-        }
-        freeReplyObject(reply);
-        hvfs_err(lib, "Set Job to use Database %d failed\n", db);
-        return err;
-    } while (0);
+            freeReplyObject(reply);
+            hvfs_err(lib, "Set Job to use Database %d failed\n", db);
+            return err;
+        } while (0);
+    }
     freeReplyObject(reply);
 
+local_change:
     hvfs_info(lib, "Change current DB from %d to %d\n", g_current_db, db);
     g_current_db = db;
 
@@ -1299,17 +1781,20 @@ int toggle_db(int flag)
 
 int main(int argc, char *argv[])
 {
-    char *shortflags = "d:r:p:i:h?", *server = "127.0.0.1";
+    redisContext *c = NULL;
+    char *shortflags = "I:d:r:p:i:h?g";
     struct option longflags[] = {
+        {"id", required_argument, 0, 'I'},
         {"dir", required_argument, 0, 'd'},
         {"server", required_argument, 0, 'r'},
         {"port", required_argument, 0, 'p'},
         {"interval", required_argument, 0, 'i'},
         {"instant", no_argument, 0, 't'},
+        {"debug", no_argument, 0, 'g'},
         {"help", no_argument, 0, 'h'},
     };
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    int err = 0, port = 9087, interval = -1;
+    int err = 0, interval = -1;
 
     while (1) {
         int longindex = -1;
@@ -1317,6 +1802,9 @@ int main(int argc, char *argv[])
         if (opt == -1)
             break;
         switch (opt) {
+        case 'I':
+            g_id = atoi(optarg);
+            break;
         case 'd':
             g_dir = strdup(optarg);
             break;
@@ -1332,6 +1820,9 @@ int main(int argc, char *argv[])
         case 't':
             g_flags |= IN_MODIFY;
             break;
+        case 'g':
+            hvfs_lib_tracing_flags = 0xffffffff;
+            break;
         case 'h':
         case '?':
             do_help();
@@ -1343,12 +1834,26 @@ int main(int argc, char *argv[])
         }
     };
 
+    if (g_id < 0) {
+        hvfs_plain(lib, "Invalid watcher ID %d\n", g_id);
+        return EINVAL;
+    }
+    
     if (!g_dir) {
         hvfs_plain(lib, "Please set the directory you want to watch!\n");
         do_help();
         err = EINVAL;
         goto out;
     }
+
+    /* get hostname */
+    err = gethostname(hostname, 128);
+    if (err) {
+        hvfs_err(lib, "gethostname() failed w/ %s\n", strerror(errno));
+        return EINVAL;
+    }
+
+    xlock_init(&g_huadan_lock);
 
     hvfs_info(lib, "Connect to Server %s:%d ... ", server, port);
     c = redisConnectWithTimeout(server, port, timeout);
@@ -1358,7 +1863,7 @@ int main(int argc, char *argv[])
     } else {
         hvfs_plain(lib, "ok.\n");
     }
-    /* use db 0 */
+    /* use db 0, w/o lock */
     do {
         redisReply *reply;
         
@@ -1375,24 +1880,24 @@ int main(int argc, char *argv[])
         goto out_close;
     } while (0);
 
-    err = toggle_db(TOGGLE_DB_INIT);
+    err = toggle_db(c, TOGGLE_DB_INIT);
     if (err) {
         hvfs_err(lib, "Toggle db failed w/ %d\n", err);
         goto out_close;
     }
 
     {
-        char *p = get_huadan_date();
+        char *p = get_huadan_date(c);
 
         if (!p) {
             g_huadan = 0;
         } else {
             g_huadan = atol(p);
         }
+        hvfs_info(lib, "Got active HUADAN %ld\n", g_huadan);
+        xfree(p);
     }
     
-    xlock_init(&g_huadan_lock);
-
     /* setup signals */
     err = __init_signal();
     if (err) {
