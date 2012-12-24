@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-21 09:40:49 macan>
+ * Time-stamp: <2012-12-21 16:58:24 macan>
  *
  */
 
@@ -213,7 +213,7 @@ char *printHuadanCSV(struct huadan *hd)
             (hd->khdip >> 8) & 0xff,
             hd->khdip & 0xff);
     ipconv(ip2, address, dbfp);
-    sprintf(str, "\"1\",\"%x\",\"%ld\",\"%ld\",\"%ld\",\"%d\",\"%d\",\"%d\",\"%d\",\"%s\",\"%d\",\"%ld\",\"%d\",\"%ld\",\"%s\"",
+    sprintf(str, "\"1\",\"%x\",\"%ld\",\"%ld\",\"%ld\",\"%d\",\"%d\",\"%d\",\"%d\",\"%s\",\"%d\",\"%ld\",\"%d\",\"%ld\",\"%s\"$EOF$",
             hd->gjlx,
             hd->qssj,
             hd->jssj,
@@ -652,120 +652,6 @@ int parse_streamid(char *ID, struct streamid *id)
     return suffix;
 }
 
-int mark_end_self()
-{
-    redisContext *c;
-    redisReply *reply;
-    int nr = 0;
-
-    if (!xg)
-        return 0;
-
-    /* USE 0th server */
-    c = xg->sites[0].context;
-    
-    reply = redisCommand(c, "INCR POP_BARRIER-%d", g_round);
-    if (reply->type == REDIS_REPLY_INTEGER) {
-        nr = reply->integer;
-    } else {
-        hvfs_warning(lib, "Not an integer reply?\n");
-    }
-    freeReplyObject(reply);
-
-    return nr;
-}
-
-static inline int test_end()
-{
-    redisContext *c;
-    redisReply *reply;
-    int nr = 0, i;
-
-    if (!xg)
-        return 0;
-
-    /* USE 0th server */
-    c = xg->sites[0].context;
-
-    if (g_round > 0) {
-        for (i = 0; i < g_round; i++) {
-            reply = redisCommand(c, "GET POP_BARRIER-%d", i);
-            if (reply->type == REDIS_REPLY_STRING) {
-                nr = atoi(reply->str);
-            } else {
-                hvfs_warning(lib, "Not an integer string reply? %s\n", reply->str);
-            }
-            freeReplyObject(reply);
-        }
-    } else {
-        reply = redisCommand(c, "GET POP_BARRIER-%d", g_round);
-        if (reply->type == REDIS_REPLY_STRING) {
-            nr = atoi(reply->str);
-        } else {
-            hvfs_warning(lib, "Not an integer string reply? %s\n", reply->str);
-        }
-        freeReplyObject(reply);
-    }
-
-    return nr;
-}
-
-static inline void clear_pop_barrier()
-{
-    redisContext *c;
-    redisReply *reply;
-
-    if (!xg)
-        return;
-
-    /* USE 0th server */
-    c = xg->sites[0].context;
-
-    if (g_round > 0) {
-        int i;
-
-        for (i = 0; i < g_round; i++) {
-            reply = redisCommand(c, "EXPIRE POP_BARRIER-%d 60", i);
-            if (reply->type == REDIS_REPLY_INTEGER) {
-                if (!reply->integer) {
-                    hvfs_warning(lib, "EXPIRE POP_BARRIER-%d failed, "
-                                 "please clean it yourself!\n", i);
-                }
-            } else {
-                hvfs_warning(lib, "Not an integer reply?\n");
-            }
-            freeReplyObject(reply);
-        }
-    } else {
-        /* clear default barrier */
-        reply = redisCommand(c, "EXPIRE POP_BARRIER-%d 60", g_round);
-        if (reply->type == REDIS_REPLY_INTEGER) {
-            if (!reply->integer) {
-                hvfs_warning(lib, "EXPIRE POP_BARRIER-%d failed, "
-                             "please clean it yourself!\n", g_round);
-            }
-        } else {
-            hvfs_warning(lib, "Not an integer reply?\n");
-        }
-        freeReplyObject(reply);
-    }
-
-    return;
-}
-
-void wait_for_all_end()
-{
-    int nr;
-    
-    do {
-        nr = test_end();
-        if (nr >= g_client_nr * g_round)
-            break;
-        sleep(1);
-    } while (0);
-    /* FIXME: !! */
-}
-
 void pop_stream(redisContext *c)
 {
     struct streamid id;
@@ -939,13 +825,13 @@ int set_file_size(char *pathname, long osize)
 {
     redisContext *c;
     redisReply *reply;
-    long saved;
+    long saved = -1;
     int err = 0;
 
     /* Use 0the server, connect it each time */
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
 
-    if (!pathname)
+    if (!pathname || !xg)
         return 0;
     
     hvfs_info(lib, "SET: Connect to Server[%ld] %s:%d ... ", 
@@ -969,24 +855,6 @@ int set_file_size(char *pathname, long osize)
     }
     
     /* default use db 0 */
-    do {
-        redisReply *reply;
-        
-        reply = redisCommand(c, "SELECT 0");
-        if (reply->type == REDIS_REPLY_STATUS) {
-            if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "SET: Select to use Database 0\n");
-                freeReplyObject(reply);
-                break;
-            }
-        }
-        hvfs_err(lib, "Select to use Database 0 failed!\n");
-        freeReplyObject(reply);
-        redisFree(c);
-
-        return err;
-    } while (0);
-
     reply = redisCommand(c, "GETSET FS:%s %ld", pathname, g_doffset);
     if (reply->type == REDIS_REPLY_NIL) {
         hvfs_info(lib, "Init file %s size to %ld!\n",
@@ -1115,20 +983,7 @@ int do_HB(char *pathname, pid_t pid)
         hvfs_plain(lib, "ok.\n");
     }
 
-    /* use db 0 */
-    do {
-        redisReply *reply;
-        
-        reply = redisCommand(c, "SELECT 0");
-        if (reply->type == REDIS_REPLY_STATUS) {
-            if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "HB: Select to use Database 0\n");
-                break;
-            }
-        }
-        hvfs_err(lib, "Select to use Database 0 failed!\n");
-        return err;
-    } while (0);
+    /* default use db 0 */
 
     reply = redisCommand(c, "EXPIRE HB:%s %d", 
                          pathname, 3 * g_interval);
@@ -1757,11 +1612,6 @@ int main(int argc, char *argv[]) {
         return EINVAL;
     }
 
-    if (setup_timers(g_interval) < 0) {
-        hvfs_err(lib, "Setup timers and thread failed!");
-        return EINVAL;
-    }
-    
     hvfs_info(lib, "Self ID: %d\n", g_id);
     hvfs_info(lib, "Round  : %d\n", g_round);
     hvfs_info(lib, "ACTION : %s\n", action);
@@ -1789,6 +1639,12 @@ int main(int argc, char *argv[]) {
     }
     xnet_group_sort(xg);
 
+    /* setup timer thread */
+    if (setup_timers(g_interval) < 0) {
+        hvfs_err(lib, "Setup timers and thread failed!");
+        return EINVAL;
+    }
+    
     for (i = 0; i < xg->asize; i++) {
         hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
                   xg->sites[i].site_id, xg->sites[i].node, xg->sites[i].port);

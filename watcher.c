@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-20 17:19:27 macan>
+ * Time-stamp: <2012-12-21 15:53:58 macan>
  *
  */
 
@@ -25,6 +25,8 @@
 #include <libgen.h>
 
 HVFS_TRACING_INIT();
+
+#define MY_LIFE                 (20501231)
 
 #define EPOLL_QUEUE_LEN         4096
 #define EPOLL_CHECK             64
@@ -111,12 +113,16 @@ struct job_info
     int CLI_COL;                /* index of client column */
 };
 
+#ifdef USE_CSV
+#define CSVSTR                  "-v",
+#endif
+
 static struct job_info job_infos[] = {
     {"ctdk_1d_normal", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
      "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s-%d",
      "logs/CTDK-CLI-LOG-%s-r%d-c%d-off%ld-jid%ld", "load", 0, 0, 0, 2, 10, 10, 13, 14,},
     {"ctdk_1d_pop", "LD_LIBRARY_PATH=lib", "ctdk_huadan_1d", 
-     "conf/cloud.conf", "conf/qqwry.dat", "data/huadan-%s",
+     "conf/cloud.conf", "conf/qqwry.dat", "data/TT_TT_HUADAN_%s_%s00_1",
      "logs/CTDK-CLI-LOG-%s-r%d-c%d-FINAL-jid%ld", "pop", 0, 0, 0, 2, 10, 10, 13, 14,},
 };
 static struct job_info *g_sort_ji = NULL;
@@ -203,6 +209,11 @@ struct file_gather *__enlarge_fg(struct file_gather *in)
 static inline
 void __free_fg(struct file_gather *fg)
 {
+    int i;
+
+    for (i = 0; i < fg->asize; i++) {
+        xfree(fg->fis[i].pathname);
+    }
     if (fg->psize > 0)
         xfree(fg->fis);
 }
@@ -452,13 +463,13 @@ static int __fg_compare(const void *a, const void *b)
 {
     const struct file_info *fia = a, *fib = b;
     long al = 0, bl = 0;
-    char *p, *q, *str;
+    char *p, *q, *str, *save;
     int nr = 0;
 
     str = strdup(fia->pathname);
     p = basename(str);
     do {
-        q = strtok(p, "-_\n");
+        q = strtok_r(p, "-_\n", &save);
         if (!q) {
             break;
         }
@@ -474,7 +485,7 @@ static int __fg_compare(const void *a, const void *b)
     p = basename(str);
     nr = 0;
     do {
-        q = strtok(p, "-_\n");
+        q = strtok_r(p, "-_\n", &save);
         if (!q) {
             break;
         }
@@ -530,15 +541,17 @@ out:
 
 static int can_scheduled(redisContext *c, struct file_info *fi, struct job_info *ji)
 {
-    char *p, *q, *str, *day;
+    char *p, *q, *str, *day = NULL, *save;
     struct job_entry *pos;
     long today;
     int nr = 0, r = 1;
 
     str = strdup(fi->pathname);
+    if (unlikely(!str))
+        return 0;
     p = basename(str);
     do {
-        q = strtok(p, "-_\n");
+        q = strtok_r(p, "-_\n", &save);
         if (!q) {
             break;
         }
@@ -549,8 +562,19 @@ static int can_scheduled(redisContext *c, struct file_info *fi, struct job_info 
         }
     } while (p = NULL, 1);
 
+    if (unlikely(!day || strlen(day) < 2)) {
+        r = 0;
+        goto out;
+    }
     day[strlen(day) - 2] = '\0';
     today = atol(day);
+    if (today > MY_LIFE) {
+        if (!check_or_add_to_ignore(c, fi->pathname)) {
+            hvfs_err(lib, "This program should not worked that long.\n");
+        }
+        r = 0;
+        goto out;
+    }
 
     /* check if we can schedule jobs */
     xlock_lock(&g_huadan_lock);
@@ -600,6 +624,7 @@ static int can_scheduled(redisContext *c, struct file_info *fi, struct job_info 
 
 out:
     xfree(str);
+    xfree(day);
     
     return r;
 }
@@ -833,12 +858,12 @@ int propose_or_update_huadan(redisContext *c)
     redisReply *reply;
     int r = 0;
 
-    reply = redisCommand(c, "HGETALL HUADAN_NEXT");
-
     if (g_id == 0) {
         /* try to peek a valid HUADAN */
         int i;
         long proposed_huadan = -1;
+
+        reply = redisCommand(c, "HGETALL HUADAN_NEXT");
 
         for (i = 0; i < reply->elements; i += 2) {
             if (proposed_huadan < 0) {
@@ -876,6 +901,8 @@ int propose_or_update_huadan(redisContext *c)
                 }
             }
         }
+
+        freeReplyObject(reply);
     } else {
         /* try to update a new HUADAN */
         char *p = get_huadan_date(c);
@@ -901,8 +928,6 @@ int propose_or_update_huadan(redisContext *c)
         }
     }
 
-    freeReplyObject(reply);
-    
     return r;
 }
 
@@ -913,14 +938,17 @@ int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
 {
     char log[PATH_MAX];
     char output[PATH_MAX], args[1500];
-    char *p, *q, *date, *day, *str;
+    char *p, *q, *date = NULL, *day = NULL, *str, *save;
     struct job_entry *pos;
     int nr = 0, rid = 0, cid = 0, found = 0, use_db, r = 0;
 
     str = strdup(pathname);
+    if (unlikely(!str)) {
+        return 0;
+    }
     p = basename(str);
     do {
-        q = strtok(p, "-_\n");
+        q = strtok_r(p, "-_\n", &save);
         if (!q) {
             break;
         }
@@ -942,8 +970,21 @@ int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
         }
     } while (p = NULL, 1);
 
+    if (unlikely(!date)) {
+        r = 0;
+        goto out;
+    }
     day = strdup(date);
+    if (unlikely(!day || strlen(day) < 2)) {
+        r = 0;
+        goto out;
+    }
     day[strlen(day) - 2] = '\0';
+    if (atol(day) > MY_LIFE) {
+        hvfs_err(lib, "This program should not worked that long.\n");
+        r = 0;
+        goto out;
+    }
 
     /* check if this job exist */
     xlock_lock(&job_lock);
@@ -1063,6 +1104,8 @@ int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
     /* free str */
 out:
     xfree(str);
+    xfree(date);
+    xfree(day);
     
     return r;
 }
@@ -1103,7 +1146,8 @@ int add_pop_job(redisContext *c, char *date, struct job_info *ji)
     if (found)
         return 0;
 
-    sprintf(output, ji->output, date);
+    /* use TT_TT_HUADAN_%s_%d00 */
+    sprintf(output, ji->output, hostname, date);
     sprintf(log, ji->log, date, ji->rid, ji->cid + 1, pos->jobid);
     hvfs_info(lib, "Add a new POP JOB id %ld for time %s\n", 
               pos->jobid, date);
@@ -1132,6 +1176,7 @@ int add_pop_job(redisContext *c, char *date, struct job_info *ji)
             "-l",
             "-D", dbstr,
             "-m", modestr,
+            CSVSTR
             NULL,
         };
         char *envp[] = {
@@ -1421,7 +1466,7 @@ static void *__event_thread_main(void *arg)
                 }
             } else if (ie->mask & IN_CLOSE_WRITE) {
                 /* do file update NOW */
-                hvfs_info(lib, "file %s closed_write\n", path);
+                hvfs_debug(lib, "file %s closed_write\n", path);
                 struct file_info fi = {
                     .pathname = path,
                     .osize = 0,
@@ -1435,7 +1480,7 @@ static void *__event_thread_main(void *arg)
                 } else {
                     fi.size = buf.st_size;
                     if (file_changed(c, &fi)) {
-                        hvfs_info(lib, "FILE %s closed.\n", fi.pathname);
+                        hvfs_info(lib, "FILE %s closed and changed.\n", fi.pathname);
                         if (can_scheduled(c, &fi, &job_infos[JI_1D_NORMAL])) {
                             add_job(c, fi.pathname, fi.osize,
                                     &job_infos[JI_1D_NORMAL]);
