@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-21 15:53:58 macan>
+ * Time-stamp: <2012-12-26 17:13:51 macan>
  *
  */
 
@@ -70,6 +70,7 @@ static int g_has_proposed = 0;
 static int g_should_clr = 0;
 static int g_no_propose = 0;
 static int g_mode = 0;
+static long g_updated_bytes = 0;
 
 #define NEXT_JOBID() (++g_jobid)
 
@@ -87,6 +88,7 @@ struct job_entry
     long jobid;
     long date;
     pid_t pid;
+    time_t begin;
     int fd;                     /* 0 for read, 1 for write */
 };
 
@@ -369,7 +371,7 @@ int file_changed(redisContext *c, struct file_info *fi)
 
     reply = redisCommand(c, "GET FS:%s", fi->pathname);
     if (reply->type == REDIS_REPLY_NIL) {
-        hvfs_warning(lib, "File %s not exist in DB, default as changed!\n",
+        hvfs_debug(lib, "File %s not exist in DB, default as changed!\n",
                      fi->pathname);
     } else if (reply->type == REDIS_REPLY_STRING) {
         size = atol(reply->str);
@@ -880,6 +882,9 @@ int propose_or_update_huadan(redisContext *c)
                 int err;
 
                 sprintf(date, "%ld", proposed_huadan);
+
+                hvfs_info(lib, "Propose to use HUADAN %s\n", date);
+
                 xlock_lock(&g_huadan_lock);
                 err = toggle_db(c, TOGGLE_DB_FLIP);
                 if (err) {
@@ -890,8 +895,6 @@ int propose_or_update_huadan(redisContext *c)
                 g_poped = g_huadan;
                 g_huadan = proposed_huadan;
                 xlock_unlock(&g_huadan_lock);
-
-                hvfs_info(lib, "Propose to use HUADAN %s\n", date);
 
                 if (g_poped > 0 && !g_has_proposed) {
                     /* there are no file changes from we start */
@@ -914,10 +917,12 @@ int propose_or_update_huadan(redisContext *c)
 
         /* update the db now */
         if (got_huadan > g_huadan) {
+            hvfs_info(lib, "Got active HUADAN %ld\n", got_huadan);
+            xlock_lock(&g_huadan_lock);
             g_poped = g_huadan;
             g_huadan = got_huadan;
-            hvfs_info(lib, "Got active HUADAN %ld\n", g_huadan);
             update_db(c);
+            xlock_unlock(&g_huadan_lock);
 
             if (g_poped > 0 && !g_has_proposed) {
                 /* there are no file changes from we start */
@@ -1007,6 +1012,7 @@ int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
         pos->offset = offset;
         pos->jobid = NEXT_JOBID();
         pos->date = atol(day);
+        pos->begin = time(NULL);
         list_add_tail(&pos->list, &jobs);
     }
     xlock_unlock(&job_lock);
@@ -1140,6 +1146,7 @@ int add_pop_job(redisContext *c, char *date, struct job_info *ji)
         pos->offset = -1;
         pos->jobid = NEXT_JOBID();
         pos->date = atol(date);
+        pos->begin = time(NULL);
         list_add_tail(&pos->list, &jobs);
     }
     xlock_unlock(&job_lock);
@@ -1237,6 +1244,22 @@ struct job_entry *del_job(int fd)
     return tpos;
 }
 
+void validate_jobs(time_t cur)
+{
+    struct job_entry *tpos = NULL, *pos;
+    
+    xlock_lock(&job_lock);
+    list_for_each_entry_safe(tpos, pos, &jobs, list) {
+        /* if a job running longer than one hour, we have to check whether we
+         * should restart it */
+        if (cur - tpos->begin > 3600) {
+            hvfs_info(lib, "JOB %ld runs for %ld seconds, it is too long.\n",
+                      tpos->jobid, cur - tpos->begin);
+        }
+    }
+    xlock_unlock(&job_lock);
+}
+
 void fina_job(redisContext *c, struct job_entry *job)
 {
     long offset;
@@ -1258,13 +1281,15 @@ void fina_job(redisContext *c, struct job_entry *job)
     if (bl == sizeof(offset)) {
         if (offset >= 0) {
             hvfs_info(lib, "Update DB: %s -> %ld\n", job->filename, offset);
+            g_updated_bytes += (offset - job->offset);
         } else if (offset == -1) {
             if (g_should_clr) {
                 clr_huadan_next(c);
                 g_should_clr = 0;
             }
 
-            hvfs_info(lib, "POP Job %ld OK.\n", job->jobid);
+            hvfs_info(lib, "POP Job %ld OK, running %ld seconds.\n", job->jobid,
+                      time(NULL) - job->begin);
         } else if (offset == -2) {
             /* peek */
             hvfs_info(lib, "PEEK Job %ld OK.\n", job->jobid);
@@ -1282,9 +1307,17 @@ void fina_job(redisContext *c, struct job_entry *job)
             g_no_propose = 1;
             g_poped = job->date;
             g_mode = 1;
+            hvfs_warning(lib, "FINAL JOB %ld failed, restart it later.\n", 
+                         job->jobid);
         } else {
             g_no_propose = 1;
         }
+    }
+
+    /* send a SIGUSR1 signal to child process */
+    if (kill(job->pid, SIGUSR1) < 0) {
+        hvfs_err(lib, "kill SIGUSR1 to process %ld: %s\n", 
+                 (long)job->pid, strerror(errno));
     }
 
     /* wait4 the child thread */
@@ -1514,6 +1547,23 @@ int is_day_start(redisContext *c, time_t cur)
     return r;
 }
 
+static void calc_bw(time_t cur)
+{
+    static time_t last_ts = 0;
+    static long last_bytes = 0;
+
+    /* print the aggregate bandwidth we load raw data */
+    if (cur - last_ts > 10) {
+        if (g_updated_bytes > last_bytes) {
+            hvfs_info(lib, "Aggregated JOB Bandwidth %.2f MB/s\n",
+                      (double)(g_updated_bytes - last_bytes) / 1024.0 / 1024.0 / 
+                      (cur - last_ts));
+            last_bytes = g_updated_bytes;
+            last_ts = cur;
+        }
+    }
+}
+
 static void *__timer_thread_main(void *arg)
 {
     redisContext *c = NULL;
@@ -1555,6 +1605,10 @@ static void *__timer_thread_main(void *arg)
         }
         /* update HUADAN: set g_poped to ACTIVE_HUADAN in need */
         propose_or_update_huadan(c);
+        /* print bandwidth info */
+        calc_bw(cur);
+        /* validate job runtime */
+        validate_jobs(cur);
     }
 
     hvfs_debug(lib, "Hooo, I am exiting...\n");

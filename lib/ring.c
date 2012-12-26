@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-14 16:45:43 macan>
+ * Time-stamp: <2012-12-26 11:50:32 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -422,7 +422,7 @@ retry:
         }
         (*xg)->sites[(*xg)->asize].site_id = site_id;
         (*xg)->sites[(*xg)->asize].flags = 0;
-        (*xg)->sites[(*xg)->asize].node = node;
+        (*xg)->sites[(*xg)->asize].node = strdup(node);
         (*xg)->sites[(*xg)->asize].port = port;
         (*xg)->asize += 1;
     } else {

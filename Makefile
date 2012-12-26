@@ -11,7 +11,7 @@
 GCC = gcc
 ECHO = /bin/echo
 CFLAGS = -Wall -DNO_LINK -pg -g -DUSE_CSV
-LDFLAGS = -Llib -lhiredis -lhvfs -lpthread
+LDFLAGS = -Llib -lhiredis -lhvfs -lpthread -lrt
 HUADAN_1D = ctdk_huadan_1d
 WATCHER = watcher
 FILES = ipsearch.c

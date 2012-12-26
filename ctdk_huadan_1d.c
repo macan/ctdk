@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-21 16:58:24 macan>
+ * Time-stamp: <2012-12-26 17:06:47 macan>
  *
  */
 
@@ -59,6 +59,7 @@ static int g_client_nr = 0;
 static pthread_t g_timer_thread = 0;
 static int g_timer_thread_stop = 0;
 static sem_t g_timer_sem;
+static sem_t g_exit_sem;
 
 static struct stream_config g_sc = {
     .ignoreact = 1,
@@ -892,7 +893,7 @@ int check_conflict(char *pathname, pid_t pid)
     /* Use 0the server, connect it each time */
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
 
-    hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
+    hvfs_info(lib, "CC: Connect to Server[%ld] %s:%d ... ", 
               xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
     c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
                                 timeout);
@@ -902,21 +903,6 @@ int check_conflict(char *pathname, pid_t pid)
     } else {
         hvfs_plain(lib, "ok.\n");
     }
-
-    /* use db 0 */
-    do {
-        redisReply *reply;
-        
-        reply = redisCommand(c, "SELECT 0");
-        if (reply->type == REDIS_REPLY_STATUS) {
-            if (strcmp(reply->str, "OK") == 0) {
-                hvfs_info(lib, "Select to use Database 0\n");
-                break;
-            }
-        }
-        hvfs_err(lib, "Select to use Database 0 failed!\n");
-        return err;
-    } while (0);
 
     reply = redisCommand(c, "SETNX HB:%s %ld", pathname, (long)pid);
     if (reply->type == REDIS_REPLY_INTEGER) {
@@ -1113,24 +1099,24 @@ int process_table(void *data, int cnt, const char **cv)
     UPDATE_FIELD(id, LYLX_SHIFT(11), zjs, atol, cv);
     UPDATE_FIELD(id, LYLX_SHIFT(12), gjlx, atoi, cv);
 
-    if (unlikely(g_sc.ignoreact)) {
-        if (!id.direction || !id.protocol) {
-            /* invalid direction, ignore it */
-            ignore_nr++;
-            goto update_pos;
-        }
+    if (EOS) {
+        id.direction = (id.direction << 2) & 0xf;
     } else {
-        if (!id.direction || !id.protocol || !(isact && !isfrg)) {
-            /* invalid direction, ignore it */
-            ignore_nr++;
-            goto update_pos;
+        if (unlikely(g_sc.ignoreact)) {
+            if (!id.direction || !id.protocol) {
+                /* invalid direction, ignore it */
+                ignore_nr++;
+                goto update_pos;
+            }
+        } else {
+            if (!id.direction || !id.protocol || !(isact && !isfrg)) {
+                /* invalid direction, ignore it */
+                ignore_nr++;
+                goto update_pos;
+            }
         }
     }
 
-    if (EOS) {
-        id.direction = (id.direction << 2) & 0xf;
-    }
-    
     if (IS_HVFS_DEBUG(lib)) {
         p = printStreamid(&id);
         hvfs_debug(lib, " => %s\n", p); free(p);
@@ -1417,6 +1403,81 @@ out:
     return err;
 }
 
+static void __sigaction_default(int signo, siginfo_t *info, void *arg)
+{
+    if (signo == SIGSEGV) {
+        hvfs_info(lib, "Recv %sSIGSEGV%s %s\n",
+                  HVFS_COLOR_RED,
+                  HVFS_COLOR_END,
+                  SIGCODES(info->si_code));
+        lib_segv(signo, info, arg);
+    } else if (signo == SIGBUS) {
+        hvfs_info(lib, "Recv %sSIGBUS%s %s\n",
+                  HVFS_COLOR_RED,
+                  HVFS_COLOR_END,
+                  SIGCODES(info->si_code));
+        lib_segv(signo, info, arg);
+    } else if (signo == SIGHUP || signo == SIGUSR1) {
+        printf("Exit CTDK_HUADAN_1D ...\n");
+        sem_post(&g_exit_sem);
+    }
+}
+
+static int __init_signal(void)
+{
+    struct sigaction ac;
+    int err;
+
+    ac.sa_sigaction = __sigaction_default;
+    err = sigemptyset(&ac.sa_mask);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    ac.sa_flags = SA_SIGINFO;
+
+#ifndef UNIT_TEST
+    err = sigaction(SIGTERM, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGHUP, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGINT, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGSEGV, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGBUS, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGQUIT, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGUSR1, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+#endif
+
+out:
+    return err;
+}
+
 int main(int argc, char *argv[]) {
     redisContext *c;
     char *action = NULL, *conf_file = NULL, *data_file = NULL, 
@@ -1476,6 +1537,15 @@ int main(int argc, char *argv[]) {
     m.table_types = TABLE_TYPES(orig_log);
     m.table_cnr = TABLE_NR(orig_log);
     m.cnr_accept = TABLE_NR_ACCEPT(orig_log);
+
+    sem_init(&g_exit_sem, 0, 0);
+    
+    /* setup signals */
+    err = __init_signal();
+    if (err) {
+        hvfs_err(lib, "Init signals failed w/ %d\n", err);
+        return err;
+    }
 
     /* get env */
     value = getenv("config");
@@ -1639,12 +1709,6 @@ int main(int argc, char *argv[]) {
     }
     xnet_group_sort(xg);
 
-    /* setup timer thread */
-    if (setup_timers(g_interval) < 0) {
-        hvfs_err(lib, "Setup timers and thread failed!");
-        return EINVAL;
-    }
-    
     for (i = 0; i < xg->asize; i++) {
         hvfs_info(lib, "Connect to Server[%ld] %s:%d ... ", 
                   xg->sites[i].site_id, xg->sites[i].node, xg->sites[i].port);
@@ -1660,6 +1724,12 @@ int main(int argc, char *argv[]) {
     __update_server_ring(&server_ring, xg);
     hvfs_info(lib, "Server connections has established!\n");
 
+    /* setup timer thread */
+    if (setup_timers(g_interval) < 0) {
+        hvfs_err(lib, "Setup timers and thread failed!");
+        return EINVAL;
+    }
+    
     if (g_action & ACTION_LOAD_DATA) {
         err = check_conflict(g_input, getpid());
         if (err) {
@@ -1737,9 +1807,14 @@ int main(int argc, char *argv[]) {
         g_doffset = -3;
     }
 
+    if (g_doffset >= 0) {
+        set_file_size(data_file, g_last_offset);
+    }
+
     if (is_fork) {
         /* write the g_doffset to stdin */
-        int bw, bl = 0;
+        int bw, bl = 0, err;
+        struct timespec ts;
         
         do {
             bw = write(0, ((void *)&g_doffset) + bl, sizeof(g_doffset) - bl);
@@ -1753,10 +1828,20 @@ int main(int argc, char *argv[]) {
         hvfs_info(lib, "Write offset %ld back to parent process done.\n",
                   g_doffset);
         fsync(0);
-    }
 
-    if (g_doffset >= 0) {
-        set_file_size(data_file, g_last_offset);
+        /* wait for the signal to exit */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 10;
+        do {
+            err = sem_timedwait(&g_exit_sem, &ts);
+            if (err < 0) {
+                if (errno == EINTR)
+                    continue;
+                hvfs_err(lib, "sem_wait() failed w/ %s\n", strerror(errno));
+                break;
+            }
+            break;
+        } while (1);
     }
 
     if (g_dfp)

@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-20 10:23:11 macan>
+ * Time-stamp: <2012-12-26 11:34:44 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -60,6 +60,10 @@
 extern atomic_t g_env_prot;
 
 #define HVFS_TRACING_INIT() atomic_t g_env_prot = {.counter = 0,}
+
+#define HVFS_TRACING_SAVE(save) save = atomic_read(&g_env_prot)
+#define HVFS_TRACING_RESET() atomic_set(&g_env_prot, 0)
+#define HVFS_TRACING_RESTORE(saved) atomic_set(&g_env_prot, saved)
 
 #ifdef HVFS_TRACING
 #define hvfs_tracing(mask, flag, lvl, f, a...) do {                     \
