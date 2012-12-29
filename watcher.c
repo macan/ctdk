@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-26 17:13:51 macan>
+ * Time-stamp: <2012-12-28 14:13:29 macan>
  *
  */
 
@@ -685,6 +685,10 @@ void do_scan(redisContext *c, time_t cur)
                 do_update = 0;
                 if (g_no_propose) 
                     g_no_propose = 0;
+            }
+            if (g_poped > G_POPED_MAX) {
+                /* there is a pending POP task */
+                do_update = 0;
             }
             xlock_unlock(&job_lock);
             if (do_update) {
@@ -1390,6 +1394,26 @@ int watcher_poll_wait(struct epoll_event *ev, int timeout)
     return epoll_wait(g_epfd, ev, EPOLL_CHECK, timeout);
 }
 
+static redisContext *rebuild_connection(redisContext *c)
+{
+    redisContext *r = c;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+    
+rebuild:
+    if (c->err) {
+        redisFree(c);
+        hvfs_debug(lib, "Connect to Server %s:%d ... ", server, port);
+        r = redisConnectWithTimeout(server, port, timeout);
+        if (r->err) {
+            hvfs_err(lib, "Connect failed w/ %s\n", r->errstr);
+            c = r;
+            goto rebuild;
+        }
+    }
+
+    return r;
+}
+
 static void *__poll_thread_main(void *arg)
 {
     struct epoll_event ev[EPOLL_CHECK];
@@ -1419,6 +1443,7 @@ static void *__poll_thread_main(void *arg)
             hvfs_err(lib, "poll wait failed w/ %s\n", strerror(errno));
             continue;
         }
+        c = rebuild_connection(c);
         for (i = 0; i < nfds; i++) {
             int fd = ev[i].data.fd;
             int err = watcher_poll_del(fd);
@@ -1473,6 +1498,7 @@ static void *__event_thread_main(void *arg)
     while (ie) {
         char *file = inotifytools_filename_from_wd(ie->wd);
 
+        c = rebuild_connection(c);
         inotifytools_printf(ie, "%T %w%f %e\n");
         if (file) {
             if (file[strlen(file) - 1] == '/')
@@ -1594,6 +1620,15 @@ static void *__timer_thread_main(void *arg)
         }
 
         cur = time(NULL);
+        /* rebuild corrupted connectons */
+        c = rebuild_connection(c);
+        /* should we trigger a stream pop */
+        if (is_day_start(c, cur)) {
+            char date[128];
+
+            sprintf(date, "%ld", g_poped);
+            add_pop_job(c, date, &job_infos[JI_1D_POP]);
+        }
         /* scan dir: reset g_poped to LOAD */
         do_scan(c, cur);
         /* should we trigger a stream pop */
@@ -1739,6 +1774,11 @@ void set_huadan_date(redisContext *c, char *date)
     
     /* Step 1: get the current active huadan */
     reply = redisCommand(c, "GET HUADAN");
+    if (!reply) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        return;
+    }
     if (reply->type == REDIS_REPLY_STRING) {
         if (strcmp(date, reply->str) == 0) {
             goto free;

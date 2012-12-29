@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-26 17:06:47 macan>
+ * Time-stamp: <2012-12-28 14:34:44 macan>
  *
  */
 
@@ -42,6 +42,7 @@ static long corrupt_nr = 0;
 static long ignore_nr = 0;
 static long poped = 0;
 static long flushed = 0;
+static long canceled = 0;
 static int g_id = -1;
 static int g_round = -1;
 static int g_local = 0;
@@ -92,7 +93,7 @@ char *printStreamid(struct streamid *id)
 {
     char *str;
 
-    str = malloc(1024);
+    str = malloc(2048);
     if (!str) {
         printf("malloc() str buffer failed\n");
         return NULL;
@@ -140,7 +141,7 @@ char *printHuadan(struct huadan *hd)
     char *str;
     struct tm *tmp1, *tmp2;
 
-    str = malloc(1024);
+    str = malloc(2048);
     if (!str) {
         hvfs_err(lib, "malloc() str buffer failed\n");
         return NULL;
@@ -203,7 +204,7 @@ char *printHuadanCSV(struct huadan *hd)
     char ip2[32];
     char *str;
 
-    str = malloc(1024);
+    str = malloc(2048);
     if (!str) {
         hvfs_err(lib, "malloc() str buffer failed\n");
         return NULL;
@@ -316,11 +317,16 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     else
         return -1;
 
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n", c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_INTEGER) {
         /* the update flag */
         switch (reply->integer) {
         case CANCEL:
             hvfs_debug(lib, "CANCEL record\n");
+            canceled++;
             break;
         case INB_INIT:
         case OUT_INIT:
@@ -391,6 +397,11 @@ int rename_stream(struct streamid *id, int suffix)
     GEN_FULL_KEY(to_key, id, suffix);
 
     reply = redisCommand(c, "RENAME %s %s", from_key, to_key);
+    if (!reply) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_ERROR) {
         /* ok, we can safely stop here */
         hvfs_debug(lib, "RENAME from %s to %s failed %s\n", 
@@ -422,6 +433,11 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
 
     /* for HGETALL command */
     reply = redisCommand(c, "HGETALL %s", key);
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_ARRAY) {
         int j;
 
@@ -471,6 +487,11 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
     if (pop) {
         /* remove the entry now */
         reply = redisCommand(c, "DEL %s", key);
+        if (unlikely(!reply)) {
+            hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                     c->err);
+            exit(-1);
+        }
         if (reply->type == REDIS_REPLY_ERROR) {
             hvfs_err(lib, "DEL %s => %s\n", key, reply->str);
             freeReplyObject(reply);
@@ -660,6 +681,11 @@ void pop_stream(redisContext *c)
     int suffix, err;
 
     reply = redisCommand(c, "KEYS S:*");
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_ARRAY) {
         int j;
 
@@ -731,6 +757,11 @@ void peek_stream(redisContext *c)
     int suffix, err;
 
     reply = redisCommand(c, "KEYS S:*");
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_ARRAY) {
         int j;
 
@@ -803,8 +834,12 @@ int use_db(int db)
         c = xg->sites[i].context;
         do {
             reply = redisCommand(c, "SELECT %d", db);
-            if (reply->type == REDIS_REPLY_STATUS) {
-                if (strcmp(reply->str, "OK") == 0) {
+            if (unlikely(!reply)) {
+                hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                         c->err);
+                return -EINVAL;
+            } else if (reply->type == REDIS_REPLY_STATUS) {
+                if (strncmp(reply->str, "OK", 2) == 0) {
                     hvfs_info(lib, "Server[%d]: Select to use Database %d\n", 
                               i, db);
                     break;
@@ -814,7 +849,7 @@ int use_db(int db)
                      db, xg->sites[i].node, reply->str);
             
             freeReplyObject(reply);
-            return EINVAL;
+            return -EINVAL;
         } while (0);
         freeReplyObject(reply);
     }
@@ -822,29 +857,15 @@ int use_db(int db)
     return err;
 }
 
-int set_file_size(char *pathname, long osize)
+int set_file_size(redisContext *c, char *pathname, long osize)
 {
-    redisContext *c;
     redisReply *reply;
     long saved = -1;
     int err = 0;
 
-    /* Use 0the server, connect it each time */
-    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-
-    if (!pathname || !xg)
+    if (!pathname)
         return 0;
     
-    hvfs_info(lib, "SET: Connect to Server[%ld] %s:%d ... ", 
-              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
-    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
-                                timeout);
-    if (c->err) {
-        hvfs_plain(lib, "failed w/ %d\n", c->err);
-        return -1;
-    } else {
-        hvfs_plain(lib, "ok.\n");
-    }
 
     /* update the g_doffset */
     if (g_dfp) {
@@ -857,6 +878,13 @@ int set_file_size(char *pathname, long osize)
     
     /* default use db 0 */
     reply = redisCommand(c, "GETSET FS:%s %ld", pathname, g_doffset);
+    if (!reply) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        err = c->err;
+        goto out;
+
+    }
     if (reply->type == REDIS_REPLY_NIL) {
         hvfs_info(lib, "Init file %s size to %ld!\n",
                   pathname, g_doffset);
@@ -879,9 +907,32 @@ int set_file_size(char *pathname, long osize)
               (double)(g_doffset - g_last_offset) / 1024.0 / 1024.0 / g_interval);
     g_last_offset = g_doffset;
 
+out:
+    return err;
+}
+
+int c_set_file_size(char *pathname, long osize)
+{
+    redisContext *c;
+    /* Use 0the server, connect it each time */
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+
+    hvfs_info(lib, "SET: Connect to Server[%ld] %s:%d ... ", 
+              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
+    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
+                                timeout);
+    if (c->err) {
+        hvfs_plain(lib, "failed w/ %d\n", c->err);
+        return -1;
+    } else {
+        hvfs_plain(lib, "ok.\n");
+    }
+
+    set_file_size(c, pathname, osize);
+    
     redisFree(c);
 
-    return err;
+    return 0;
 }
 
 int check_conflict(char *pathname, pid_t pid)
@@ -905,6 +956,11 @@ int check_conflict(char *pathname, pid_t pid)
     }
 
     reply = redisCommand(c, "SETNX HB:%s %ld", pathname, (long)pid);
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_INTEGER) {
         if (reply->integer == 0) {
             /* key conflict */
@@ -924,6 +980,11 @@ int check_conflict(char *pathname, pid_t pid)
     /* update TTL */
     reply = redisCommand(c, "EXPIRE HB:%s %d", 
                          pathname, 3 * g_interval);
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
     if (reply->type == REDIS_REPLY_INTEGER) {
         if (reply->integer == 0) {
             /* key not exist?!! */
@@ -946,7 +1007,7 @@ out:
     return err;
 }
 
-int do_HB(char *pathname, pid_t pid)
+int remove_conflict(char *pathname)
 {
     redisContext *c;
     redisReply *reply;
@@ -955,10 +1016,7 @@ int do_HB(char *pathname, pid_t pid)
     /* Use 0the server, connect it each time */
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
 
-    if (!pathname)
-        return 1;
-    
-    hvfs_info(lib, "HB: Connect to Server[%ld] %s:%d ... ", 
+    hvfs_info(lib, "CC: Connect to Server[%ld] %s:%d ... ", 
               xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
     c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
                                 timeout);
@@ -969,10 +1027,44 @@ int do_HB(char *pathname, pid_t pid)
         hvfs_plain(lib, "ok.\n");
     }
 
-    /* default use db 0 */
+    reply = redisCommand(c, "DEL HB:%s", pathname);
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        exit(-1);
+    }
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        hvfs_info(lib, "Clear HB:%s w/ %lld!\n", pathname, reply->integer);
+    } else {
+        hvfs_warning(lib, "Not an integer reply? del failed %s\n",
+                     reply->str);
+        err = -EINVAL;
+        goto out;
+    }
+    freeReplyObject(reply);
 
+out:
+    redisFree(c);
+
+    return err;
+}
+
+int do_HB(redisContext *c, char *pathname, pid_t pid)
+{
+    redisReply *reply;
+    int err = 0;
+
+    if (!pathname)
+        return 1;
+    
+    /* default use db 0 */
     reply = redisCommand(c, "EXPIRE HB:%s %d", 
                          pathname, 3 * g_interval);
+    if (!reply) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n",
+                 c->err);
+        goto out;
+    }
     if (reply->type == REDIS_REPLY_INTEGER) {
         if (reply->integer == 0) {
             /* key not exist?!! */
@@ -989,7 +1081,7 @@ int do_HB(char *pathname, pid_t pid)
     }
     freeReplyObject(reply);
     
-    redisFree(c);
+out:
 
     return err;
 }
@@ -1294,11 +1386,36 @@ static void __itimer_default(int signo, siginfo_t *info, void *arg)
     return;
 }
 
+static redisContext *rebuild_connection(redisContext *c)
+{
+    redisContext *r = c;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+    
+rebuild:
+    if (!c || c->err) {
+        redisFree(c);
+        hvfs_debug(lib, "REConnect to Server %s:%d ... ",
+                   xg->sites[0].node, xg->sites[0].port);
+        r = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port, timeout);
+        if (r->err) {
+            hvfs_err(lib, "Connect failed w/ %s\n", r->errstr);
+            c = r;
+            goto rebuild;
+        }
+    }
+
+    return r;
+}
+
 static void *__timer_thread_main(void *arg)
 {
     sigset_t set;
     time_t cur, last = 0;
-    int err;
+    long last_process = 0;
+    struct timeval timeout = { 20, 500000 }; // 20.5 seconds
+    redisContext *c;
+    int err, nr = 0;
+
 
     hvfs_debug(lib, "I am running...\n");
 
@@ -1306,6 +1423,21 @@ static void *__timer_thread_main(void *arg)
     sigemptyset(&set);
     sigaddset(&set, SIGALRM);
     pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGABRT);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    /* Use 0the server, connect it on startup */
+    hvfs_info(lib, "TT: Connect to Server[%ld] %s:%d ... ", 
+              xg->sites[0].site_id, xg->sites[0].node, xg->sites[0].port);
+    c = redisConnectWithTimeout(xg->sites[0].node, xg->sites[0].port,
+                                timeout);
+    if (c->err) {
+        hvfs_plain(lib, "failed w/ %d\n", c->err);
+    } else {
+        hvfs_plain(lib, "ok.\n");
+    }
 
     /* then, we loop for the timer events */
     while (!g_timer_thread_stop) {
@@ -1316,6 +1448,7 @@ static void *__timer_thread_main(void *arg)
             hvfs_err(lib, "sem_wait() failed w/ %s\n", strerror(errno));
         }
 
+        c = rebuild_connection(c);
         cur = time(NULL);
         if (last == 0)
             last = cur;
@@ -1324,11 +1457,22 @@ static void *__timer_thread_main(void *arg)
             hvfs_info(lib, ">>>>> Update Offset and HB Info >>>>\n");
             last = cur;
             if (g_action & ACTION_LOAD_DATA) {
-                set_file_size(g_input, g_last_offset);
-                do_HB(g_input, getpid());
+                set_file_size(c, g_input, g_last_offset);
+                do_HB(c, g_input, getpid());
             } else if (g_action & (ACTION_PEEK_HUADAN | ACTION_POP_HUADAN)) {
-                do_HB(g_output, getpid());
+                do_HB(c, g_output, getpid());
             }
+            /* check if we are blocked? */
+            if (process_nr + ignore_nr + corrupt_nr + poped + flushed > last_process) {
+                last_process = process_nr + ignore_nr + corrupt_nr + poped + flushed;
+                nr = 0;
+            } else {
+                nr++;
+            }
+        }
+        if (nr > 10) {
+            hvfs_info(lib, "Detect ourself is not working, exit myself!\n");
+            exit(-1);
         }
     }
 
@@ -1405,8 +1549,8 @@ out:
 
 static void __sigaction_default(int signo, siginfo_t *info, void *arg)
 {
-    if (signo == SIGSEGV) {
-        hvfs_info(lib, "Recv %sSIGSEGV%s %s\n",
+    if (signo == SIGSEGV || signo == SIGABRT) {
+        hvfs_info(lib, "Recv %sSIGSEGV/SIGABRT%s %s\n",
                   HVFS_COLOR_RED,
                   HVFS_COLOR_END,
                   SIGCODES(info->si_code));
@@ -1418,7 +1562,7 @@ static void __sigaction_default(int signo, siginfo_t *info, void *arg)
                   SIGCODES(info->si_code));
         lib_segv(signo, info, arg);
     } else if (signo == SIGHUP || signo == SIGUSR1) {
-        printf("Exit CTDK_HUADAN_1D ...\n");
+        /* do not print anything to eliminate deadlock */
         sem_post(&g_exit_sem);
     }
 }
@@ -1438,6 +1582,11 @@ static int __init_signal(void)
 
 #ifndef UNIT_TEST
     err = sigaction(SIGTERM, &ac, NULL);
+    if (err) {
+        err = errno;
+        goto out;
+    }
+    err = sigaction(SIGABRT, &ac, NULL);
     if (err) {
         err = errno;
         goto out;
@@ -1685,7 +1834,6 @@ int main(int argc, char *argv[]) {
     hvfs_info(lib, "Self ID: %d\n", g_id);
     hvfs_info(lib, "Round  : %d\n", g_round);
     hvfs_info(lib, "ACTION : %s\n", action);
-    
 
     /* open ipdb file */
     dbfp = fopen(ipdb_file, "rb");
@@ -1754,7 +1902,7 @@ int main(int argc, char *argv[]) {
     if (huadan_fd < 0) {
         hvfs_err(lib, "open file '%s' failed w/ %s\n",
                  huadan_file, strerror(errno));
-        return errno;
+        goto out_disconnect;
     }
     hvfs_info(lib, "Open HUADAN file '%s' in %s mode\n", huadan_file, 
               mode ? "O_APPEND" : "O_TRUNC");
@@ -1763,7 +1911,7 @@ int main(int argc, char *argv[]) {
     err = use_db(db);
     if (err) {
         hvfs_err(lib, "USE DB %d failed w/ %d\n", db, err);
-        return err;
+        goto out_disconnect;
     } else {
         hvfs_info(lib, "USE DB %d OK\n", db);
     }
@@ -1808,9 +1956,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (g_doffset >= 0) {
-        set_file_size(data_file, g_last_offset);
+        if (c_set_file_size(data_file, g_last_offset)) {
+            /* last offset write failed, do not report to parent process! */
+            return -1;
+        }
     }
 
+    /* it is safe to exit the timer thread */
+    g_timer_thread_stop = 1;
+    if (g_timer_thread) {
+        sem_post(&g_timer_sem);
+        pthread_join(g_timer_thread, NULL);
+    }
+    
     if (is_fork) {
         /* write the g_doffset to stdin */
         int bw, bl = 0, err;
@@ -1854,12 +2012,17 @@ int main(int argc, char *argv[]) {
 
     hvfs_info(lib, "+Success to OFFSET %ld \n"
               "Stream Line Stat NRs => "
-              "Process %ld, Corrupt %ld, Ignore %ld, "
+              "Process %ld (Cancel %ld), Corrupt %ld, Ignore %ld, "
               "Huadan {pop %ld {pop %ld, flush %ld}, peek %ld} \n",
               g_doffset,
-              process_nr, corrupt_nr, ignore_nr, 
+              process_nr, canceled, corrupt_nr, ignore_nr, 
               pop_huadan_nr, poped, flushed, peek_huadan_nr);
 
+out_disconnect:
+    if (g_action & ACTION_LOAD_DATA)
+        remove_conflict(g_input);
+    else if (g_action & (ACTION_PEEK_HUADAN | ACTION_POP_HUADAN))
+        remove_conflict(g_output);
     fina_xg(xg);
 
     return 0;

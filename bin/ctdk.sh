@@ -3,7 +3,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-12-19 14:59:13 macan>
+# Time-stamp: <2012-12-28 15:32:35 macan>
 #
 # This is the mangement script for Pomegranate
 #
@@ -195,19 +195,28 @@ function start_watcher() {
     WATCH_DIR="/mnt/data1/src-data/tt/tt_ori_log/"
     WATCH_INTV=10
     if [ "x$1" == "x" ]; then
-        ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
-        for x in $ipnr; do 
-            ip=`echo $x | awk -F: '{print $1}'`
-            port=`echo $x | awk -F: '{print $3}'`
-            id=`echo $x | awk -F: '{print $2}'`
-            if [ "x$id" == "x0" ]; then
-                WIP=$ip
-                WPORT=$port
-            fi
-            $SSH $UN$ip "cd $HVFS_HOME/; LD_LIBRARY_PATH=$HVFS_HOME/lib ./watcher -r $WIP -p $WPORT -d $WATCH_DIR -i $WATCH_INTV -I $id > $LOG_DIR/watcher.$id.log" > /dev/null &
-        done
-        echo "Start Redis server done."
+        ENDNR=1000
+    else
+        ENDNR=$1
     fi
+
+    THISNR=0
+    ipnr=`cat $CONFIG_FILE | grep "^redis:" | awk -F: '{print $2":"$4":"$3}'`
+    for x in $ipnr; do 
+        if [ $THISNR -ge $ENDNR ]; then
+            break;
+        fi
+        ip=`echo $x | awk -F: '{print $1}'`
+        port=`echo $x | awk -F: '{print $3}'`
+        id=`echo $x | awk -F: '{print $2}'`
+        if [ "x$id" == "x0" ]; then
+            WIP=$ip
+            WPORT=$port
+        fi
+        $SSH $UN$ip "cd $HVFS_HOME/; LD_LIBRARY_PATH=$HVFS_HOME/lib ./watcher -r $WIP -p $WPORT -d $WATCH_DIR -i $WATCH_INTV -I $id > $LOG_DIR/watcher.$id.log" > /dev/null &
+        let THISNR=$THISNR+1
+    done
+    echo "Start Redis server done."
 }
 
 function stop_client() {
