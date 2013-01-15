@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-28 14:34:44 macan>
+ * Time-stamp: <2012-12-29 13:20:07 macan>
  *
  */
 
@@ -280,8 +280,8 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     redisReply *reply = NULL;
 
 #define STREAM_HEAD     "HUPDBY %s DON %d "
-#define INB_STREAM      STREAM_HEAD "izjs %d igjlx %d ijlsj %ld ijcsj %ld icljip %d ibs %d"
-#define OUT_STREAM      STREAM_HEAD "ozjs %d ogjlx %d ojlsj %ld ojcsj %ld ocljip %d obs %d"
+#define INB_STREAM      STREAM_HEAD "izjs %d igjlx %d ijlsj %ld ijcsj %ld ibs %d"
+#define OUT_STREAM      STREAM_HEAD "ozjs %d ogjlx %d ojlsj %ld ojcsj %ld obs %d"
 
     /* for HUPDBY command, we accept >4 arguments */
     GEN_HASH_KEY(key, id);
@@ -300,7 +300,6 @@ int addOrUpdateStream(struct streamid *id, int suffix)
                              id->gjlx, /* tool type is ORed */
                              id->jlsj,
                              id->jcsj,
-                             id->cljip,
                              id->bs);
     else if (id->direction & STREAM_OUT||
              id->direction & STREAM_OUTNIL)
@@ -312,7 +311,6 @@ int addOrUpdateStream(struct streamid *id, int suffix)
                              id->gjlx, /* tool type is ORed */
                              id->jlsj,
                              id->jcsj,
-                             id->cljip,
                              id->bs);
     else
         return -1;
