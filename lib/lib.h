@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-07 11:34:17 macan>
+ * Time-stamp: <2013-01-17 09:29:23 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -70,6 +70,9 @@ struct xnet_group_entry
 
     void *context;
     u64 nr;
+
+    /* private struct */
+    void *private;
 };
 
 struct xnet_group

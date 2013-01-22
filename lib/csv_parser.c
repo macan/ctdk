@@ -32,7 +32,8 @@ struct csv_parser_data
 // post-condition: **buff points to just before either a comma,
 //			  or a newline, or E_QUOTED_STRING is returned.
 //
-static int csv_process_quoted_string(char **buff)
+static inline
+int csv_process_quoted_string(char **buff)
 {
 	char * q = *buff;
 	char * p = q++;
@@ -115,7 +116,7 @@ int csv_parse(FILE *fp, CSV_CB_record_handler cb, void *params)
 	d.params   = params;
 
 	while ( d.buff[MAX_LINE_LEN-1]='*',
-			NULL!= fgets (d.buff, MAX_LINE_LEN, fp)
+			NULL!= fgets_unlocked (d.buff, MAX_LINE_LEN, fp)
 	){
 		int r;
 		if(d.buff[MAX_LINE_LEN-1]=='\0' && d.buff[MAX_LINE_LEN-2]!='\n')
@@ -137,20 +138,10 @@ int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
 	d.params   = params;
 
 	while ( d.buff[MAX_LINE_LEN-1]='*',
-			NULL!= fgets (d.buff, MAX_LINE_LEN, fp) ) {
+			NULL!= fgets_unlocked (d.buff, MAX_LINE_LEN, fp) ) {
 		int r;
 
-        /* remove tailing $EOF$\n */
-        if ((r = strlen(d.buff)) >= 6) {
-            if (strncmp(d.buff + r - 6, "$EOF$", 5) == 0) {
-                d.buff[r - 6] = '\n';
-            } else {
-                /* partital line */
-                return E_PARTITAL_LINE;
-            }
-        } else {
-            return E_PARTITAL_LINE;
-        }
+
 		if(d.buff[MAX_LINE_LEN-1]=='\0' && d.buff[MAX_LINE_LEN-2]!='\n')
 			return E_LINE_TOO_WIDE;
 		if (E_QUOTED_STRING==(r=csv_parse_line (&d) ) )

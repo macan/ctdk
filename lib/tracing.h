@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-28 10:02:57 macan>
+ * Time-stamp: <2013-01-16 12:24:19 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -141,10 +141,14 @@ extern atomic_t g_env_prot;
                  hvfs_##module##_tracing_flags, \
                  KERN_VERB, f, ## a)
 
+#ifndef OPTIMIZE
 #define hvfs_debug(module, f, a...)             \
     hvfs_tracing((HVFS_DEBUG | HVFS_PRECISE),   \
                  hvfs_##module##_tracing_flags, \
                  KERN_DEBUG, f, ## a)
+#else
+#define hvfs_debug(module, f, a...)
+#endif
 
 #define hvfs_entry(module, f, a...)             \
     hvfs_tracing((HVFS_ENTRY | HVFS_PRECISE),   \

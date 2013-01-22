@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-29 13:20:07 macan>
+ * Time-stamp: <2013-01-18 15:46:08 macan>
  *
  */
 
@@ -33,6 +33,12 @@ static FILE *g_dfp = NULL;
 static long g_doffset = 0;
 static long g_last_offset = 0;
 static int g_interval = 10;
+static int g_pnr = 7000;        /* 7k */
+static int pnr = 0;             /* internal use */
+static int g_pipeline = 0;      /* disable by default */
+static int g_pp_sr = 0;
+static int g_suffix_max = 0;
+static sem_t *g_pp_sr_sem = NULL;
 
 #define HUADAN_FSYNC_NR         1000
 static long pop_huadan_nr = 0;
@@ -40,9 +46,10 @@ static long peek_huadan_nr = 0;
 static long process_nr = 0;
 static long corrupt_nr = 0;
 static long ignore_nr = 0;
-static long poped = 0;
+static atomic64_t poped = {.counter = 0,};
 static long flushed = 0;
-static long canceled = 0;
+static atomic64_t canceled = {.counter = 0,};
+static long newstream_nr = 0;
 static int g_id = -1;
 static int g_round = -1;
 static int g_local = 0;
@@ -59,6 +66,7 @@ static int g_client_nr = 0;
 
 static pthread_t g_timer_thread = 0;
 static int g_timer_thread_stop = 0;
+static int g_pp_sr_thread_stop = 0;
 static sem_t g_timer_sem;
 static sem_t g_exit_sem;
 
@@ -71,19 +79,19 @@ static struct stream_config g_sc = {
 #define DO_POP_RENAME   1
 #define DO_POP_ONLY     2
 
-#define GEN_HASH_KEY(key, id) do {                          \
-        snprintf(key, 127, "S:%u:%u:%u:%u:%u",              \
-                 id->fwqip,                                 \
-                 id->fwqdk,                                 \
-                 id->khdip,                                 \
-                 id->khddk,                                 \
-                 id->protocol                               \
+#define GEN_HASH_KEY(key, id, klen) do {                    \
+        klen = snprintf(key, 127, "S:%u:%u:%u:%u:%u",       \
+                        id->fwqip,                          \
+                        id->fwqdk,                          \
+                        id->khdip,                          \
+                        id->khddk,                          \
+                        id->protocol                        \
             );                                              \
     } while (0)
 
-#define GEN_FULL_KEY(key, id, suffix) do {                  \
+#define GEN_FULL_KEY(key, id, klen, suffix) do {            \
         if (unlikely(suffix > 0)) {                         \
-            snprintf(key + strlen(key), 127, "+%d",         \
+            snprintf(key + klen, 127, "+%d",                \
                      suffix                                 \
                 );                                          \
         }                                                   \
@@ -107,7 +115,7 @@ char *printStreamid(struct streamid *id)
             ((id->direction & STREAM_IN) ? "INB   " :
              ((id->direction & STREAM_OUT) ? "OUT   " :
               ((id->direction & STREAM_INNIL) ? "INBNIL":
-               ((id->direction & STREAM_OUTNIL) ? "OUTNIL" : "XXXXXX")))));
+               ((id->direction & STREAM_OUTNIL) ? "OUTNIL" : "??????")))));
 
     return str;
 }
@@ -251,6 +259,8 @@ char *printHuadanLine(struct huadan *hd)
     return str;
 }
 
+/* this function calls most frequently, optimize it!
+ */
 static inline
 redisContext *get_server_from_key(char *key)
 {
@@ -260,13 +270,25 @@ redisContext *get_server_from_key(char *key)
     p = ring_get_point(key, &server_ring);
     hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
     e = p->private;
+#ifndef OPTIMIZE
     if (unlikely(!e)) {
         hvfs_err(lib, "Server %ld doesn't exist.\n", p->site_id);
         return NULL;
     }
+#endif
     e->nr++;
 
     return e->context;
+}
+
+static inline
+struct xnet_group_entry *get_xg_from_key(char *key)
+{
+    struct chp *p;
+
+    p = ring_get_point(key, &server_ring);
+    hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
+    return p->private;
 }
 
 int new_stream(struct streamid *id, int suffix);
@@ -276,6 +298,7 @@ int new_stream(struct streamid *id, int suffix);
 int addOrUpdateStream(struct streamid *id, int suffix)
 {
     char key[128];
+    int klen;
     redisContext *c;
     redisReply *reply = NULL;
 
@@ -284,11 +307,11 @@ int addOrUpdateStream(struct streamid *id, int suffix)
 #define OUT_STREAM      STREAM_HEAD "ozjs %d ogjlx %d ojlsj %ld ojcsj %ld obs %d"
 
     /* for HUPDBY command, we accept >4 arguments */
-    GEN_HASH_KEY(key, id);
+    GEN_HASH_KEY(key, id, klen);
     
     c = get_server_from_key(key);
 
-    GEN_FULL_KEY(key, id, suffix);
+    GEN_FULL_KEY(key, id, klen, suffix);
 
     if (id->direction & STREAM_IN ||
         id->direction & STREAM_INNIL)
@@ -324,7 +347,7 @@ int addOrUpdateStream(struct streamid *id, int suffix)
         switch (reply->integer) {
         case CANCEL:
             hvfs_debug(lib, "CANCEL record\n");
-            canceled++;
+            atomic64_inc(&canceled);
             break;
         case INB_INIT:
         case OUT_INIT:
@@ -340,7 +363,7 @@ int addOrUpdateStream(struct streamid *id, int suffix)
             break;
         case ALL_CLOSED:
             hvfs_debug(lib, "FULLY CLOSE STREAM\n");
-            poped++;
+            atomic64_inc(&poped);
             pop_huadan(id, suffix, DO_POP_RENAME);
             break;
         case INB_IGNORE:
@@ -362,19 +385,353 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     return 0;
 }
 
-int new_stream(struct streamid *id, int suffix)
+static inline
+void handle_pp_reply(redisReply *reply, struct pp_rec_header *prh, struct pp_rec *spr)
+{
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        /* the update flag */
+        switch (reply->integer) {
+        case CANCEL:
+            hvfs_debug(lib, "CANCEL record\n");
+            atomic64_inc(&canceled);
+            break;
+        case INB_INIT:
+        case OUT_INIT:
+            hvfs_debug(lib, "INIT STREAM\n");
+            break;
+        case INB_UPDATED:
+        case OUT_UPDATED:
+            hvfs_debug(lib, "UPDATE STREAM\n");
+            break;
+        case INB_CLOSED:
+        case OUT_CLOSED:
+            hvfs_debug(lib, "Half CLOSE STREAM\n");
+            break;
+        case ALL_CLOSED:
+            hvfs_debug(lib, "FULLY CLOSE STREAM\n");
+            atomic64_inc(&poped);
+            /* do not pop any huadan */
+            break;
+        case INB_IGNORE:
+        case OUT_IGNORE:
+        case TIMED_IGNORE:
+        {
+            struct pp_rec *pr;
+            
+            hvfs_debug(lib, "IGNORE record\n");
+
+            /* alloc a pp_rec entry */
+            pr = xrealloc(prh->array, (prh->nr + 1) * sizeof(*pr));
+            if (pr) {
+                prh->array = pr;
+                prh->array[prh->nr] = *spr;
+                prh->nr++;
+            }
+            break;
+        }
+        }
+    } else {
+        hvfs_warning(lib, "%s", reply->str);
+    }
+
+    return;
+}
+
+int addOrUpdateStreamPipeline(struct streamid *id, int suffix, int flush);
+
+int new_stream_pipeline(struct streamid *id, int suffix)
 {
     char str[128];
+    int klen;
+    
     suffix += 1;
 
-    GEN_HASH_KEY(str, id);
-    GEN_FULL_KEY(str, id, suffix);
+    GEN_HASH_KEY(str, id, klen);
+    GEN_FULL_KEY(str, id, klen, suffix);
     hvfs_debug(lib, "New -> %s\n", str);
     
     /* try next stream until 1000 */
-    if (suffix >= 1000) {
+    if (suffix > g_suffix_max) {
+        g_suffix_max = suffix;
+        if (suffix >= 10000) {
+            return EINVAL;
+        }
+    }
+
+    return addOrUpdateStreamPipeline(id, suffix, 0);
+}
+
+int prh_ready()
+{
+    struct pipeline *pp;
+    int i, ready = 0;
+    
+    for (i = 0; i < xg->asize; i++) {
+        int val;
+        
+        pp = xg->sites[i].private;
+        sem_getvalue(&pp->pbs, &val);
+        ready += val;
+    }
+
+    return (ready == xg->asize);
+}
+
+static inline void prh_handle_pp()
+{
+    struct pipeline *pp;
+    int nr = 0;
+    int i, j;
+
+    /* wait for any prs */
+    for (i = 0; i < xg->asize; i++) {
+        int val;
+        
+        pp = xg->sites[i].private;
+    reget:
+        sem_getvalue(&pp->pbs, &val);
+        if (val != 1) {
+            sched_yield();
+            goto reget;
+        }
+        
+        if (pp->prh.nr > 0) {
+            for (j = 0; j < pp->prh.nr; j++) {
+                if (nr >= g_pnr) {
+                    while (!prh_ready())
+                        sched_yield();
+                    nr = 0;
+                }
+                new_stream_pipeline(&pp->prh.array[j].id, pp->prh.array[j].suffix);
+                newstream_nr++;
+                nr++;
+            }
+            xfree(pp->prh.array);
+            memset(&pp->prh, 0, sizeof(pp->prh));
+        }
+    }
+}
+
+int addOrUpdateStreamPipeline(struct streamid *id, int suffix, int flush)
+{
+    struct xnet_group_entry *e;
+    struct pipeline *pp;
+    redisContext *c;
+    struct pp_rec *spr;
+    char key[128];
+    int klen;
+
+    if (!id && flush)
+        goto do_flush;
+    
+    GEN_HASH_KEY(key, id, klen);
+    e = get_xg_from_key(key);
+    GEN_FULL_KEY(key, id, klen, suffix);
+
+    e->nr++;
+    c = e->context;
+    pp = e->private;
+
+    if (id->direction & STREAM_IN ||
+        id->direction & STREAM_INNIL) {
+        xlock_lock(&pp->lock);
+        redisAppendCommand(c, INB_STREAM,
+                           key,
+                           id->direction,
+                           id->zjs, /* if id->zjs > current value,
+                                     * then do update, otherwise, do
+                                     * not update */
+                           id->gjlx, /* tool type is ORed */
+                           id->jlsj,
+                           id->jcsj,
+                           id->bs);
+        xlock_unlock(&pp->lock);
+    } else if (id->direction & STREAM_OUT||
+             id->direction & STREAM_OUTNIL) {
+        xlock_lock(&pp->lock);
+        redisAppendCommand(c, OUT_STREAM,
+                           key,
+                           id->direction,
+                           id->zjs, /* if id->zjs > current value,
+                                     * then do update, otherwise, do
+                                     * not update */
+                           id->gjlx, /* tool type is ORed */
+                           id->jlsj,
+                           id->jcsj,
+                           id->bs);
+        xlock_unlock(&pp->lock);
+    } else {
+        return -1;
+    }
+
+    spr = pp->buf + sizeof(*spr) * pp->pnr;
+    spr->id = *id;
+    spr->suffix = suffix;
+    pp->pnr++;
+    pnr++;
+
+    if (pnr >= g_pnr) {
+        /* ok, we should get the reply */
+        void *tmp;
+        int i, j, err;
+
+    do_flush:
+        if (g_pp_sr) {
+            for (i = 0; i < xg->asize; i++) {
+                pp = xg->sites[i].private;
+                if (pp->pnr) {
+                retry:
+                    err = sem_wait(&pp->pbs);
+                    if (err < 0) {
+                        if (errno == EINTR)
+                            goto retry;
+                        hvfs_err(lib, "sem_wait pipeline sem failed w/ %s\n",
+                                 strerror(errno));
+                        exit(-1);
+                    }
+                    /* exchange buf2 and buf */
+                    tmp = pp->buf;
+                    pp->buf = pp->buf2;
+                    pp->buf2 = tmp;
+                    pp->pnr2 = pp->pnr;
+                    sem_post(&g_pp_sr_sem[i]);
+                    pp->pnr = 0;
+                }
+            }
+            /* reset counters */
+            pnr = 0;
+
+            if (flush) {
+                while (!prh_ready())
+                    sched_yield();
+                prh_handle_pp();
+            } else if (prh_ready()) {
+                prh_handle_pp();
+            }
+
+        } else {
+            struct pp_rec_header prh;
+            redisReply *reply = NULL;
+
+            memset(&prh, 0, sizeof(prh));
+            
+            /* iterate the xg group to get replies */
+            for (i = 0; i < xg->asize; i++) {
+                pp = xg->sites[i].private;
+                if (pp->pnr) {
+                    for (j = 0; j < pp->pnr; j++) {
+                        if (redisGetReply(xg->sites[i].context, (void **)&reply) == 
+                            REDIS_OK) {
+                            handle_pp_reply(reply, &prh, pp->buf + 
+                                            sizeof(struct pp_rec) * j);
+                            freeReplyObject(reply);
+                        } else {
+                            hvfs_err(lib, "get reply failed w/ %d\n", 
+                                     ((redisContext *)(xg->sites[i].context))->err);
+                        }
+                    }
+                    pp->pnr = 0;
+                }
+            }
+            /* reset counters */
+            pnr = 0;
+            
+            if (prh.nr > 0) {
+                for (i = 0; i < prh.nr; i++) {
+                    new_stream_pipeline(&prh.array[i].id, prh.array[i].suffix);
+                    newstream_nr++;
+                }
+                xfree(prh.array);
+            }
+        }
+    }
+    
+    return 0;
+}
+
+static void *__pp_sr_thread_main(void *arg)
+{
+    struct pipeline *pp;
+    redisReply *reply;
+    sigset_t set;
+    int idx = (long)arg, i;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    while (!g_pp_sr_thread_stop) {
+        if (sem_wait(&g_pp_sr_sem[idx]) < 0) {
+            if (errno == EINTR)
+                continue;
+            hvfs_err(lib, "sem_wait() failed w/ %s\n", strerror(errno));
+        }
+
+        pp = xg->sites[idx].private;
+
+        /* iterate the buf2 array */
+        for (i = 0; i < pp->pnr2; i++) {
+            xlock_lock(&pp->lock);
+            if (redisGetReply(xg->sites[idx].context, (void **)&reply) == REDIS_OK) {
+                xlock_unlock(&pp->lock);
+                handle_pp_reply(reply, &pp->prh, pp->buf2 +
+                                sizeof(struct pp_rec) * i);
+                freeReplyObject(reply);
+            } else {
+                xlock_unlock(&pp->lock);
+                hvfs_err(lib, "get reply failed w/ %d\n",
+                         ((redisContext *)(xg->sites[idx].context))->err);
+            }
+        }
+        pp->pnr2 = 0;
+
+        sem_post(&pp->pbs);
+    }
+
+    pthread_exit(0);
+}
+
+int setup_sr_threads(int nr)
+{
+    pthread_t g_pp_sr_threads[nr];
+    int err, i;
+    
+    g_pp_sr_sem = xmalloc(sizeof(sem_t) * nr);
+    if (!g_pp_sr_sem) {
+        hvfs_err(lib, "xmalloc pp_sr_sem array failed\n");
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < nr; i++) {
+        sem_init(&g_pp_sr_sem[i], 0, 0);
+        err = pthread_create(&g_pp_sr_threads[i], NULL, &__pp_sr_thread_main,
+                             (void *)(long)i);
+        if (err) {
+            hvfs_err(lib, "create sr thread failed w/ %s\n", strerror(errno));
+            err = -errno;
+            goto out;
+        }
+    }
+out:
+    return err;
+}
+
+int new_stream(struct streamid *id, int suffix)
+{
+    char str[128];
+    int klen;
+    
+    suffix += 1;
+
+    GEN_HASH_KEY(str, id, klen);
+    GEN_FULL_KEY(str, id, klen, suffix);
+    hvfs_debug(lib, "New -> %s\n", str);
+    
+    /* try next stream until 1000 */
+    if (suffix >= 10000) {
         return EINVAL;
     }
+    newstream_nr++;
 
     return addOrUpdateStream(id, suffix);
 }
@@ -385,14 +742,15 @@ int rename_stream(struct streamid *id, int suffix)
     char from_key[128], to_key[128];
     redisContext *c;
     redisReply *reply;
+    int klen1, klen2;
 
-    GEN_HASH_KEY(from_key, id);
-    GEN_HASH_KEY(to_key, id);
+    GEN_HASH_KEY(from_key, id, klen1);
+    GEN_HASH_KEY(to_key, id, klen2);
 
     c = get_server_from_key(from_key);
 
-    GEN_FULL_KEY(from_key, id, suffix + 1);
-    GEN_FULL_KEY(to_key, id, suffix);
+    GEN_FULL_KEY(from_key, id, klen1, suffix + 1);
+    GEN_FULL_KEY(to_key, id, klen2, suffix);
 
     reply = redisCommand(c, "RENAME %s %s", from_key, to_key);
     if (!reply) {
@@ -420,14 +778,15 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
     char key[128];
     redisContext *c;
     redisReply *reply;
+    int klen;
 
     memset(stat, 0, sizeof(*stat));
 
-    GEN_HASH_KEY(key, id);
+    GEN_HASH_KEY(key, id, klen);
 
     c = get_server_from_key(key);
 
-    GEN_FULL_KEY(key, id, suffix);
+    GEN_FULL_KEY(key, id, klen, suffix);
 
     /* for HGETALL command */
     reply = redisCommand(c, "HGETALL %s", key);
@@ -1142,7 +1501,7 @@ out:
 int process_table(void *data, int cnt, const char **cv)
 {
     struct manager *m = (struct manager *)data;
-    struct streamid id = {0,};
+    struct streamid id;
     char *p, *q;
     int EOS = 0, isact = 0, isfrg = 0;
 
@@ -1152,6 +1511,7 @@ int process_table(void *data, int cnt, const char **cv)
         goto update_pos;
     }
 
+    memset(&id, 0, sizeof(id));
     UPDATE_FIELD(id, LYLX_SHIFT(1), jlsj, atol, cv);
     UPDATE_FIELD(id, LYLX_SHIFT(2), jcsj, atol, cv);
     UPDATE_FIELD(id, LYLX_SHIFT(3), cljip, atoi, cv);
@@ -1191,6 +1551,11 @@ int process_table(void *data, int cnt, const char **cv)
 
     if (EOS) {
         id.direction = (id.direction << 2) & 0xf;
+        if (!id.direction || !id.protocol) {
+            /* invalid direction, ignore it */
+            ignore_nr++;
+            goto update_pos;
+        }
     } else {
         if (unlikely(g_sc.ignoreact)) {
             if (!id.direction || !id.protocol) {
@@ -1212,7 +1577,10 @@ int process_table(void *data, int cnt, const char **cv)
         hvfs_debug(lib, " => %s\n", p); free(p);
     }
 
-    addOrUpdateStream(&id, 0);
+    if (g_pipeline)
+        addOrUpdateStreamPipeline(&id, 0, 0);
+    else
+        addOrUpdateStream(&id, 0);
     process_nr++;
 
     /* update the current valid stream offset */
@@ -1241,7 +1609,7 @@ int parse_csv_file(char *filepath, long offset)
 
     g_dfp = fp;
     
-    switch (csv_parse_eof(fp, process_table, &m)) {
+    switch (csv_parse(fp, process_table, &m)) {
     case E_LINE_TOO_WIDE:
         hvfs_err(lib, "Error parsing csv: line too wide.\n");
         break;
@@ -1251,6 +1619,12 @@ int parse_csv_file(char *filepath, long offset)
     case E_PARTITAL_LINE:
         hvfs_err(lib, "Error parsing csv: partitial line.\n");
         break;
+    }
+
+    /* if it is in pipeline mode, we should do final flush */
+    while (g_pipeline && pnr > 0) {
+        hvfs_info(lib, "PNR is %d, Begin Flush ...\n", pnr);
+        addOrUpdateStreamPipeline(NULL, 0, 1);
     }
     
     /* update the g_doffset finally */
@@ -1461,8 +1835,10 @@ static void *__timer_thread_main(void *arg)
                 do_HB(c, g_output, getpid());
             }
             /* check if we are blocked? */
-            if (process_nr + ignore_nr + corrupt_nr + poped + flushed > last_process) {
-                last_process = process_nr + ignore_nr + corrupt_nr + poped + flushed;
+            if (process_nr + ignore_nr + corrupt_nr + atomic64_read(&poped) 
+                + flushed > last_process) {
+                last_process = process_nr + ignore_nr + corrupt_nr + 
+                    atomic64_read(&poped) + flushed;
                 nr = 0;
             } else {
                 nr++;
@@ -1625,6 +2001,38 @@ out:
     return err;
 }
 
+struct pipeline *__alloc_pipeline()
+{
+    struct pipeline *p = NULL;
+
+    p = xzalloc(sizeof(*p));
+    if (!p) {
+        hvfs_err(lib, "xzalloc() pipeline struct failed\n");
+        return NULL;
+    }
+    
+    p->pnr = 0;
+    p->buf = xzalloc(sizeof(struct pp_rec) * g_pnr);
+    if (!p->buf) {
+        hvfs_err(lib, "xzalloc() pipeline buffer failed\n");
+        goto free;
+    }
+    p->pnr2 = 0;
+    p->buf2 = xzalloc(sizeof(struct pp_rec) * g_pnr);
+    if (!p->buf2) {
+        hvfs_err(lib, "xzalloc() pipeline buffer failed\n");
+        xfree(p->buf);
+        goto free;
+    }
+    sem_init(&p->pbs, 0, 1);
+    xlock_init(&p->lock);
+
+    return p;
+free:
+    xfree(p);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     redisContext *c;
     char *action = NULL, *conf_file = NULL, *data_file = NULL, 
@@ -1634,7 +2042,7 @@ int main(int argc, char *argv[]) {
     int err = 0, is_fork = 0, i, db = 3, mode = 0;
 
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:";
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:Mp::";
     struct option longflags[] = {
         {"id", required_argument, 0, 'd'},
         {"round", required_argument, 0, 'r'},
@@ -1649,6 +2057,8 @@ int main(int argc, char *argv[]) {
         {"database", required_argument, 0, 'D'},
         {"interval", required_argument, 0, 'I'},
         {"mode", required_argument, 0, 'm'},
+        {"pipeline", optional_argument, 0, 'p'},
+        {"multithread", no_argument, 0, 'M'},
         {"isfork", no_argument, 0, 'f'},
         {"local", no_argument, 0, 'l'},
         {"debug", no_argument, 0, 'g'},
@@ -1764,6 +2174,14 @@ int main(int argc, char *argv[]) {
         case 'v':
             g_output_format = OUTPUT_CSV;
             break;
+        case 'p':
+            g_pipeline = 1;
+            if (optarg)
+                g_pnr = atoi(optarg);
+            break;
+        case 'M':
+            g_pp_sr = 1;
+            break;
         case 'h':
         case '?':
             do_help();
@@ -1866,9 +2284,22 @@ int main(int argc, char *argv[]) {
             hvfs_plain(lib, "ok.\n");
         }
         xg->sites[i].context = c;
+
+        /* alloc the pipeline buffer */
+        xg->sites[i].private = __alloc_pipeline();
+        if (!xg->sites[i].private) {
+            hvfs_err(lib, "xzalloc pipeline buffer failed!\n");
+            return ENOMEM;
+        }
     }
     __update_server_ring(&server_ring, xg);
     hvfs_info(lib, "Server connections has established!\n");
+
+    /* setup pipeline threads */
+    if (setup_sr_threads(xg->asize) < 0) {
+        hvfs_err(lib, "Setup sr threads failed!");
+        return EINVAL;
+    }
 
     /* setup timer thread */
     if (setup_timers(g_interval) < 0) {
@@ -2011,10 +2442,12 @@ int main(int argc, char *argv[]) {
     hvfs_info(lib, "+Success to OFFSET %ld \n"
               "Stream Line Stat NRs => "
               "Process %ld (Cancel %ld), Corrupt %ld, Ignore %ld, "
-              "Huadan {pop %ld {pop %ld, flush %ld}, peek %ld} \n",
+              "Huadan {pop %ld {pop %ld, flush %ld}, peek %ld} \n"
+              "NewStream %ld MaxSuffix %d\n",
               g_doffset,
-              process_nr, canceled, corrupt_nr, ignore_nr, 
-              pop_huadan_nr, poped, flushed, peek_huadan_nr);
+              process_nr, atomic64_read(&canceled), corrupt_nr, ignore_nr, 
+              pop_huadan_nr, atomic64_read(&poped), flushed, peek_huadan_nr,
+              newstream_nr, g_suffix_max);
 
 out_disconnect:
     if (g_action & ACTION_LOAD_DATA)

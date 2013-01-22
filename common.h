@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-18 11:35:24 macan>
+ * Time-stamp: <2013-01-18 11:19:50 macan>
  *
  */
 
@@ -180,5 +180,30 @@ struct stream_config
 
 void ipconv(char *ip, char *address, FILE *fp);
 int pop_huadan(struct streamid *id, int suffix, int flag);
+
+/* Pipeline */
+struct pp_rec
+{
+    struct streamid id;
+    int suffix;
+};
+
+struct pp_rec_header
+{
+    struct pp_rec *array;
+    int nr;
+};
+
+struct pipeline
+{
+    /* pipeline buffer */
+    void *buf;
+    void *buf2;                 /* atomic exchange the two buffer */
+    sem_t pbs;
+    int pnr;
+    int pnr2;
+    struct pp_rec_header prh;
+    xlock_t lock;
+};
 
 #endif

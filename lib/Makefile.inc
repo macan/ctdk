@@ -2,7 +2,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2012-12-07 11:33:50 macan>
+# Time-stamp: <2013-01-16 12:24:29 macan>
 #
 # This is the makefile for HVFS project.
 #
@@ -46,7 +46,7 @@ CFLAGS += $(XCFLAGS) $(O3_OPT)
 CFLAGS += -Wall -DCDATE="\"$(COMPILE_DATE)\"" -DGIT_SHA="\"$(GIT_SHA)\""\
 			-DCHOST="\"$(COMPILE_HOST)\"" -I$(INC_PATH) \
 			-I$(LIB_PATH) -D_GNU_SOURCE \
-			-DCPU_CORE=$(__CORES__) -DHVFS_TRACING
+			-DCPU_CORE=$(__CORES__) -DHVFS_TRACING -DOPTIMIZE
 
 ifndef JEMALLOC_HOME
 ifeq ($(JEMALLOC),)
