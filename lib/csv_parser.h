@@ -5,9 +5,11 @@
 
 #include <stdio.h>  // for fopen, fclose, etc.
 #include <string.h> // for strlen
+#include <errno.h>
+#include <unistd.h>
 
 
-#define MAX_LINE_LEN (1024*512)
+#define MAX_LINE_LEN (128 * 1024)
 #define MAX_COLUMN_COUNT 1024
 /* digest from CSV wiki: http://en.wikipedia.org/wiki/Comma-separated_values
 
@@ -35,5 +37,6 @@ typedef int (*CSV_CB_record_handler)
 
 int csv_parse (FILE *fp, CSV_CB_record_handler cb, void *params);
 int csv_parse_eof (FILE *fp, CSV_CB_record_handler cb, void *params);
+int csv_parse_fast(int fd, CSV_CB_record_handler cb, void *params, int linemax);
 
 #endif

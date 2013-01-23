@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2013-01-18 15:46:08 macan>
+ * Time-stamp: <2013-01-23 18:13:47 macan>
  *
  */
 
@@ -30,6 +30,7 @@ static char *g_output = NULL;
 static int huadan_fd = -1;
 static FILE *dbfp = NULL;
 static FILE *g_dfp = NULL;
+static int g_dfd = -1;
 static long g_doffset = 0;
 static long g_last_offset = 0;
 static int g_interval = 10;
@@ -38,6 +39,7 @@ static int pnr = 0;             /* internal use */
 static int g_pipeline = 0;      /* disable by default */
 static int g_pp_sr = 0;
 static int g_suffix_max = 0;
+static int g_parse_byfd = 0;
 static sem_t *g_pp_sr_sem = NULL;
 
 #define HUADAN_FSYNC_NR         1000
@@ -95,6 +97,16 @@ static struct stream_config g_sc = {
                      suffix                                 \
                 );                                          \
         }                                                   \
+    } while (0)
+
+#define GEN_HASH_KEY_STR(key, id, klen) do {                \
+        klen = snprintf(key, 127, "S:%s:%s:%s:%s:%u",       \
+                        id->fwqip,                          \
+                        id->fwqdk,                          \
+                        id->khdip,                          \
+                        id->khddk,                          \
+                        id->protocol                        \
+            );                                              \
     } while (0)
 
 char *printStreamid(struct streamid *id)
@@ -375,6 +387,96 @@ int addOrUpdateStream(struct streamid *id, int suffix)
             /* new stream? */
             hvfs_debug(lib, "NEW STREAM\n");
             new_stream(id, suffix);
+            break;
+        }
+    } else {
+        hvfs_warning(lib, "%s", reply->str);
+    }
+    freeReplyObject(reply);
+
+    return 0;
+}
+
+int new_stream_str(struct streamid_str *id, int suffix);
+
+int addOrUpdateStreamStr(struct streamid_str *id, int suffix)
+{
+    char key[128];
+    int klen;
+    redisContext *c;
+    redisReply *reply = NULL;
+
+#define INB_STREAM_STR      STREAM_HEAD "izjs %s igjlx %s ijlsj %s ijcsj %s ibs %s"
+#define OUT_STREAM_STR      STREAM_HEAD "ozjs %s ogjlx %s ojlsj %s ojcsj %s obs %s"
+
+    /* for HUPDBY command, we accept >4 arguments */
+    GEN_HASH_KEY_STR(key, id, klen);
+    
+    c = get_server_from_key(key);
+
+    GEN_FULL_KEY(key, id, klen, suffix);
+
+    if (id->direction & STREAM_IN ||
+        id->direction & STREAM_INNIL)
+        reply = redisCommand(c, INB_STREAM_STR,
+                             key,
+                             id->direction,
+                             id->zjs, /* if id->zjs > current value, then do
+                                       * update, otherwise, do not update */
+                             id->gjlx, /* tool type is ORed */
+                             id->jlsj,
+                             id->jcsj,
+                             id->bs);
+    else if (id->direction & STREAM_OUT||
+             id->direction & STREAM_OUTNIL)
+        reply = redisCommand(c, OUT_STREAM_STR,
+                             key,
+                             id->direction,
+                             id->zjs, /* if id->zjs > current value, then do
+                                       * update, otherwise, do not update */
+                             id->gjlx, /* tool type is ORed */
+                             id->jlsj,
+                             id->jcsj,
+                             id->bs);
+    else
+        return -1;
+
+    if (unlikely(!reply)) {
+        hvfs_err(lib, "Connection corrupted, failed w/ %d\n", c->err);
+        exit(-1);
+    }
+    if (reply->type == REDIS_REPLY_INTEGER) {
+        /* the update flag */
+        switch (reply->integer) {
+        case CANCEL:
+            hvfs_debug(lib, "CANCEL record\n");
+            atomic64_inc(&canceled);
+            break;
+        case INB_INIT:
+        case OUT_INIT:
+            hvfs_debug(lib, "INIT STREAM\n");
+            break;
+        case INB_UPDATED:
+        case OUT_UPDATED:
+            hvfs_debug(lib, "UPDATE STREAM\n");
+            break;
+        case INB_CLOSED:
+        case OUT_CLOSED:
+            hvfs_debug(lib, "Half CLOSE STREAM\n");
+            break;
+        case ALL_CLOSED:
+            hvfs_debug(lib, "FULLY CLOSE STREAM\n");
+            atomic64_inc(&poped);
+            break;
+        case INB_IGNORE:
+        case OUT_IGNORE:
+            hvfs_debug(lib, "IGNORE record\n");
+            new_stream_str(id, suffix);
+            break;
+        case TIMED_IGNORE:
+            /* new stream? */
+            hvfs_debug(lib, "NEW STREAM\n");
+            new_stream_str(id, suffix);
             break;
         }
     } else {
@@ -694,7 +796,7 @@ static void *__pp_sr_thread_main(void *arg)
 int setup_sr_threads(int nr)
 {
     pthread_t g_pp_sr_threads[nr];
-    int err, i;
+    int err = 0, i;
     
     g_pp_sr_sem = xmalloc(sizeof(sem_t) * nr);
     if (!g_pp_sr_sem) {
@@ -734,6 +836,26 @@ int new_stream(struct streamid *id, int suffix)
     newstream_nr++;
 
     return addOrUpdateStream(id, suffix);
+}
+
+int new_stream_str(struct streamid_str *id, int suffix)
+{
+    char str[128];
+    int klen;
+    
+    suffix += 1;
+
+    GEN_HASH_KEY_STR(str, id, klen);
+    GEN_FULL_KEY(str, id, klen, suffix);
+    hvfs_debug(lib, "New -> %s\n", str);
+    
+    /* try next stream until 1000 */
+    if (suffix >= 10000) {
+        return EINVAL;
+    }
+    newstream_nr++;
+
+    return addOrUpdateStreamStr(id, suffix);
 }
 
 /* rename suffix + 1 to suffix until there is no (suffix + 1) key */
@@ -1225,14 +1347,24 @@ int set_file_size(redisContext *c, char *pathname, long osize)
     
 
     /* update the g_doffset */
-    if (g_dfp) {
-        long __off = ftell(g_dfp);
-
-        if (__off > 0) {
-            g_doffset = __off;
+    if (!g_parse_byfd) {
+        if (g_dfp) {
+            long __off = ftell(g_dfp);
+            
+            if (__off > 0) {
+                g_doffset = __off;
+            }
+        }
+    } else {
+        if (g_dfd > 0) {
+            long __off = lseek(g_dfd, 0, SEEK_CUR);
+            
+            if (__off > 0) {
+                g_doffset = __off;
+            }
         }
     }
-    
+
     /* default use db 0 */
     reply = redisCommand(c, "GETSET FS:%s %ld", pathname, g_doffset);
     if (!reply) {
@@ -1589,6 +1721,89 @@ update_pos:
     return 0;
 }
 
+int process_table_bystr(void *data, int cnt, const char **cv)
+{
+    struct manager *m = (struct manager *)data;
+    struct streamid_str id;
+    char *p, *q;
+    int EOS = 0, isact = 0, isfrg = 0;
+
+    if (unlikely(cnt < m->cnr_accept)) {
+        /* ignore this line */
+        corrupt_nr++;
+        goto update_pos;
+    }
+
+    memset(&id, 0, sizeof(id));
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(1), jlsj, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(2), jcsj, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(3), cljip, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(5), fwqip, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(6), fwqdk, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(7), khdip, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(8), khddk, cv);
+    {
+        /* parse the string */
+        p = (char *)cv[LYLX_SHIFT(9)];
+        do {
+            q = strtok(p, ";,\n");
+            if (!q) {
+                break;
+            } else if (strcmp(q, "INB") == 0) {
+                id.direction = STREAM_IN;
+            } else if (strcmp(q, "OUT") == 0) {
+                id.direction = STREAM_OUT;
+            } else if (strcmp(q, "UDA") == 0) {
+                id.protocol = STREAM_UDP;
+            } else if (strcmp(q, "TDA") == 0) {
+                id.protocol = STREAM_TCP;
+            } else if (strcmp(q, "NIL") == 0) {
+                /* this is the stream end flag, we should POP the
+                 * six-entry tuple from db[0] to db[1] */
+                EOS = 1;
+            } else if (strcmp(q, "ACT") == 0) {
+                isact = 1;
+            } else if (strcmp(q, "FRG") == 0) {
+                isfrg = 1;
+            }
+        } while (p = NULL, 1);
+    }
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(10), bs, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(11), zjs, cv);
+    UPDATE_FIELD_STR(id, LYLX_SHIFT(12), gjlx, cv);
+
+    if (EOS) {
+        id.direction = (id.direction << 2) & 0xf;
+        if (!id.direction || !id.protocol) {
+            /* invalid direction, ignore it */
+            ignore_nr++;
+            goto update_pos;
+        }
+    } else {
+        if (unlikely(g_sc.ignoreact)) {
+            if (!id.direction || !id.protocol) {
+                /* invalid direction, ignore it */
+                ignore_nr++;
+                goto update_pos;
+            }
+        } else {
+            if (!id.direction || !id.protocol || !(isact && !isfrg)) {
+                /* invalid direction, ignore it */
+                ignore_nr++;
+                goto update_pos;
+            }
+        }
+    }
+
+    addOrUpdateStreamStr(&id, 0);
+    process_nr++;
+
+    /* update the current valid stream offset */
+update_pos:
+
+    return 0;
+}
+
 int parse_csv_file(char *filepath, long offset)
 {
     FILE *fp;
@@ -1631,6 +1846,56 @@ int parse_csv_file(char *filepath, long offset)
     {
         long __off = ftell(g_dfp);
         
+        if (__off > 0) {
+            g_doffset = __off;
+        }
+    }
+
+    return offset;
+}
+
+int parse_csv_file_byfd(char *filepath, long offset)
+{
+    int fd;
+    
+    if ((fd = open(filepath, O_RDONLY)) < 0) {
+        hvfs_err(lib, "Cannot open input file '%s' for %s\n", 
+                 filepath, strerror(errno));
+        return -errno;
+    }
+    if (offset > 0) {
+        if (lseek(fd, offset, SEEK_SET) < 0) {
+            hvfs_err(lib, "fseek stream to POS %ld failed w/ %s\n",
+                     offset, strerror(errno));
+            return -errno;
+        }
+        g_doffset = offset;
+    }
+
+    g_dfd = fd;
+    
+    switch (csv_parse_fast(fd, process_table, &m, 150)) {
+    case E_LINE_TOO_WIDE:
+        hvfs_err(lib, "Error parsing csv: line too wide.\n");
+        break;
+    case E_QUOTED_STRING:
+        hvfs_err(lib, "Error parsing csv: ill-formatted quoted string.\n");
+        break;
+    case E_PARTITAL_LINE:
+        hvfs_err(lib, "Error parsing csv: partitial line.\n");
+        break;
+    }
+
+    /* if it is in pipeline mode, we should do final flush */
+    while (g_pipeline && pnr > 0) {
+        hvfs_info(lib, "PNR is %d, Begin Flush ...\n", pnr);
+        addOrUpdateStreamPipeline(NULL, 0, 1);
+    }
+    
+    /* update the g_doffset finally */
+    {
+        long __off = lseek(g_dfd, 0, SEEK_CUR);
+
         if (__off > 0) {
             g_doffset = __off;
         }
@@ -1688,7 +1953,10 @@ void do_help()
 
 static inline int do_load_data(char *data_file, long offset)
 {
-    return parse_csv_file(data_file, offset);
+    if (!g_parse_byfd)
+        return parse_csv_file(data_file, offset);
+    else
+        return parse_csv_file_byfd(data_file, offset);
 }
 
 static inline void do_peek_huadan()
@@ -2042,7 +2310,7 @@ int main(int argc, char *argv[]) {
     int err = 0, is_fork = 0, i, db = 3, mode = 0;
 
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:Mp::";
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:MFp::";
     struct option longflags[] = {
         {"id", required_argument, 0, 'd'},
         {"round", required_argument, 0, 'r'},
@@ -2059,6 +2327,7 @@ int main(int argc, char *argv[]) {
         {"mode", required_argument, 0, 'm'},
         {"pipeline", optional_argument, 0, 'p'},
         {"multithread", no_argument, 0, 'M'},
+        {"byfd", no_argument, 0, 'F'},
         {"isfork", no_argument, 0, 'f'},
         {"local", no_argument, 0, 'l'},
         {"debug", no_argument, 0, 'g'},
@@ -2181,6 +2450,9 @@ int main(int argc, char *argv[]) {
             break;
         case 'M':
             g_pp_sr = 1;
+            break;
+        case 'F':
+            g_parse_byfd = 1;
             break;
         case 'h':
         case '?':
@@ -2431,8 +2703,13 @@ int main(int argc, char *argv[]) {
         } while (1);
     }
 
-    if (g_dfp)
-        fclose(g_dfp);
+    if (!g_parse_byfd) {
+        if (g_dfp)
+            fclose(g_dfp);
+    } else {
+        if (g_dfd)
+            close(g_dfd);
+    }
 
     /* clean the huadan file */
     if (!pop_huadan_nr && !peek_huadan_nr) {

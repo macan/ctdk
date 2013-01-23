@@ -2,7 +2,7 @@
 # Copyright (c) 2009 Ma Can <ml.macana@gmail.com>
 #                           <macan@ncic.ac.cn>
 #
-# Time-stamp: <2013-01-15 10:21:17 macan>
+# Time-stamp: <2013-01-23 18:08:09 macan>
 #
 # This is the makefile for HVFS project.
 #
@@ -10,7 +10,7 @@
 
 GCC = gcc
 ECHO = /bin/echo
-CFLAGS = -Wall -DNO_LINK -pg -g -DUSE_CSV -DUSE_LYLX
+CFLAGS = -Wall -DNO_LINK -pg -g -DUSE_CSV -DUSE_LYLX -O2
 LDFLAGS = -Llib -lhiredis -lhvfs -lpthread -lrt
 HUADAN_1D = ctdk_huadan_1d
 WATCHER = watcher

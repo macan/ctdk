@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2013-01-18 11:19:50 macan>
+ * Time-stamp: <2013-01-23 17:50:17 macan>
  *
  */
 
@@ -94,6 +94,31 @@ struct streamid
     unsigned int bs;            /* packet number */
     unsigned long zjs;          /* byte num */
     unsigned int gjlx;          /* tool type, should AND */
+};
+
+struct streamid_str
+{
+    char *fwqip;         /* server ip */
+    char * fwqdk;         /* server port */
+    char *khdip;         /* client ip */
+    char *khddk;         /* client port */
+#define STREAM_IN               0x01
+#define STREAM_OUT              0x02
+#define STREAM_INNIL            0x04
+#define STREAM_OUTNIL           0x08
+    unsigned int direction:4;   /* IN: 1; OUT: 2
+                                 * INNIL: 4; OUTNIL 8
+                                 */
+#define STREAM_TCP              1
+#define STREAM_UDP              2
+    unsigned int protocol:28;   /* TCP: 1; UDA: 2 */
+
+    char *jlsj;         /* recored time */
+    char *jcsj;         /* detect time */
+    char *cljip;         /* detect machine ip */
+    char *bs;            /* packet number */
+    char *zjs;          /* byte num */
+    char *gjlx;          /* tool type, should AND */
 };
 
 struct huadan

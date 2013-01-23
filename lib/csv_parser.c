@@ -9,7 +9,7 @@ struct csv_parser_data
 {
 	CSV_CB_record_handler callback;
 	void				* params;
-	char				  buff[MAX_LINE_LEN];
+	char				* buff;
 	int				   field_count;
 	const char *		  column_values[MAX_COLUMN_COUNT];
 };
@@ -32,8 +32,7 @@ struct csv_parser_data
 // post-condition: **buff points to just before either a comma,
 //			  or a newline, or E_QUOTED_STRING is returned.
 //
-static inline
-int csv_process_quoted_string(char **buff)
+static int csv_process_quoted_string(char **buff)
 {
 	char * q = *buff;
 	char * p = q++;
@@ -68,8 +67,8 @@ done_quoted_string:
 }
 
 //  returns
-//   0 : to continue parse next record
-//   non-zero:  abort processing
+//   >= 0 : to continue parse next record
+//   <  0 :  abort processing
 //	   E_QUOTED_STRING is a special case of non-zero return values
 //
 static int csv_parse_line (struct csv_parser_data * d)
@@ -81,26 +80,23 @@ static int csv_parse_line (struct csv_parser_data * d)
 
 	while ( (c=*buff)!='\n' )
 	{
-		switch (c)
-		{
-		case ',': // mark the end of the current field, and beginning of next field
-			*buff='\0';
-			d->column_values[d->field_count++]=buff+1;
-			break;
-		case '"': // beginning a quoted string
+        if (c == '"') {
+            // beginning a quoted string
 			if( E_QUOTED_STRING==csv_process_quoted_string(&buff) )
 				return E_QUOTED_STRING;
-			break;
-		//default: no action
-
-		}
+		} else if (c == ',') {
+            // mark the end of the current field, and beginning of next field
+			*buff='\0';
+			d->column_values[d->field_count++]=buff+1;
+        }
 		++buff;
 	}
 	// now buff points to '\n', replace it with a '\0'
 	*buff='\0';
 
-	return d->callback (d->params, d->field_count, d->column_values);
+	d->callback (d->params, d->field_count, d->column_values);
 
+    return (buff - d->buff + 1);
 }
 // returns
 //  0: on success
@@ -109,11 +105,12 @@ static int csv_parse_line (struct csv_parser_data * d)
 //
 int csv_parse(FILE *fp, CSV_CB_record_handler cb, void *params)
 {
-	//char buff[MAX_LINE_LEN];
+	char buff[MAX_LINE_LEN];
 	struct csv_parser_data d;
 	
 	d.callback = cb;
 	d.params   = params;
+    d.buff = buff;
 
 	while ( d.buff[MAX_LINE_LEN-1]='*',
 			NULL!= fgets_unlocked (d.buff, MAX_LINE_LEN, fp)
@@ -123,7 +120,7 @@ int csv_parse(FILE *fp, CSV_CB_record_handler cb, void *params)
 			return E_LINE_TOO_WIDE;
 		if (E_QUOTED_STRING==(r=csv_parse_line (&d) ) )
 			return E_QUOTED_STRING;
-		else if (r!=0)
+		else if (r<0)
 			break;
 	}
 	return 0;
@@ -131,11 +128,12 @@ int csv_parse(FILE *fp, CSV_CB_record_handler cb, void *params)
 
 int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
 {
-	//char buff[MAX_LINE_LEN];
+	char buff[MAX_LINE_LEN];
 	struct csv_parser_data d;
 	
 	d.callback = cb;
 	d.params   = params;
+    d.buff = buff;
 
 	while ( d.buff[MAX_LINE_LEN-1]='*',
 			NULL!= fgets_unlocked (d.buff, MAX_LINE_LEN, fp) ) {
@@ -146,9 +144,64 @@ int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
 			return E_LINE_TOO_WIDE;
 		if (E_QUOTED_STRING==(r=csv_parse_line (&d) ) )
 			return E_QUOTED_STRING;
-		else if (r!=0)
+		else if (r<0)
 			break;
 	}
 	return 0;
 }
 
+int csv_parse_fast(int fd, CSV_CB_record_handler cb, void *params, int linemax)
+{
+	char buff[MAX_LINE_LEN];
+	struct csv_parser_data d;
+    void *p, *b;
+    int br, bl, bt, last_line = 0;
+	
+	d.callback = cb;
+	d.params   = params;
+
+    p = b = buff;
+    bt = MAX_LINE_LEN;
+
+    /* read in some data */
+readin:
+    bl = 0;
+    do {
+        br = read(fd, p + bl, bt - bl);
+        if (br < 0) {
+            perror("read");
+            goto out;
+        } else if (br == 0) {
+            /* read EOF */
+            last_line = 1;
+            break;
+        }
+        bl += br;
+    } while (bl < bt);
+    p = b;
+
+    /* handle to parse line */
+    while (MAX_LINE_LEN - (p - b) > linemax || last_line) {
+        int r;
+
+        d.buff = p;
+		if (E_QUOTED_STRING == (r = csv_parse_line(&d))) {
+			return E_QUOTED_STRING;
+        } else if (r < 0)
+			break;
+        p += r;
+        if (p - b >= bl)
+            break;
+    }
+
+    /* we should memmove the remain buffer */
+    bl = (MAX_LINE_LEN - (p - b));
+    memmove(b, p, bl);
+    p = b + bl;
+    bt = MAX_LINE_LEN - bl;
+    if (!last_line)
+        goto readin;
+
+out:
+	return 0;
+}
