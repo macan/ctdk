@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2013-01-23 18:13:47 macan>
+ * Time-stamp: <2013-02-05 13:24:03 macan>
  *
  */
 
@@ -40,6 +40,7 @@ static int g_pipeline = 0;      /* disable by default */
 static int g_pp_sr = 0;
 static int g_suffix_max = 0;
 static int g_parse_byfd = 0;
+static int g_fast_bsize = 128 * 1024;
 static sem_t *g_pp_sr_sem = NULL;
 
 #define HUADAN_FSYNC_NR         1000
@@ -76,6 +77,9 @@ static struct stream_config g_sc = {
     .ignoreact = 1,
 };
 
+lib_timer_def();
+double ACC = 0.0;
+
 /* for getStreamStat() use */
 #define DO_PEEK         0
 #define DO_POP_RENAME   1
@@ -97,16 +101,6 @@ static struct stream_config g_sc = {
                      suffix                                 \
                 );                                          \
         }                                                   \
-    } while (0)
-
-#define GEN_HASH_KEY_STR(key, id, klen) do {                \
-        klen = snprintf(key, 127, "S:%s:%s:%s:%s:%u",       \
-                        id->fwqip,                          \
-                        id->fwqdk,                          \
-                        id->khdip,                          \
-                        id->khddk,                          \
-                        id->protocol                        \
-            );                                              \
     } while (0)
 
 char *printStreamid(struct streamid *id)
@@ -274,12 +268,12 @@ char *printHuadanLine(struct huadan *hd)
 /* this function calls most frequently, optimize it!
  */
 static inline
-redisContext *get_server_from_key(char *key)
+redisContext *get_server_from_key(char *key, int klen)
 {
     struct chp *p;
     struct xnet_group_entry *e;
 
-    p = ring_get_point(key, &server_ring);
+    p = ring_get_point(key, klen, &server_ring);
     hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
     e = p->private;
 #ifndef OPTIMIZE
@@ -294,11 +288,11 @@ redisContext *get_server_from_key(char *key)
 }
 
 static inline
-struct xnet_group_entry *get_xg_from_key(char *key)
+struct xnet_group_entry *get_xg_from_key(char *key, int klen)
 {
     struct chp *p;
 
-    p = ring_get_point(key, &server_ring);
+    p = ring_get_point(key, klen, &server_ring);
     hvfs_debug(lib, "KEY %s => Server %s:%d\n", key, p->node, p->port);
     return p->private;
 }
@@ -314,19 +308,18 @@ int addOrUpdateStream(struct streamid *id, int suffix)
     redisContext *c;
     redisReply *reply = NULL;
 
-#define STREAM_HEAD     "HUPDBY %s DON %d "
-#define INB_STREAM      STREAM_HEAD "izjs %d igjlx %d ijlsj %ld ijcsj %ld ibs %d"
-#define OUT_STREAM      STREAM_HEAD "ozjs %d ogjlx %d ojlsj %ld ojcsj %ld obs %d"
+#define STREAM_HEAD     "HHD %s D %d "
+#define INB_STREAM      STREAM_HEAD "iz %d ig %d ijlsj %ld ijcsj %ld ib %d"
+#define OUT_STREAM      STREAM_HEAD "oz %d og %d ojlsj %ld ojcsj %ld ob %d"
 
     /* for HUPDBY command, we accept >4 arguments */
     GEN_HASH_KEY(key, id, klen);
     
-    c = get_server_from_key(key);
+    c = get_server_from_key(key, klen);
 
     GEN_FULL_KEY(key, id, klen, suffix);
 
-    if (id->direction & STREAM_IN ||
-        id->direction & STREAM_INNIL)
+    if (id->direction & (STREAM_IN | STREAM_INNIL))
         reply = redisCommand(c, INB_STREAM,
                              key,
                              id->direction,
@@ -336,8 +329,7 @@ int addOrUpdateStream(struct streamid *id, int suffix)
                              id->jlsj,
                              id->jcsj,
                              id->bs);
-    else if (id->direction & STREAM_OUT||
-             id->direction & STREAM_OUTNIL)
+    else if (id->direction & (STREAM_OUT | STREAM_OUTNIL))
         reply = redisCommand(c, OUT_STREAM,
                              key,
                              id->direction,
@@ -387,96 +379,6 @@ int addOrUpdateStream(struct streamid *id, int suffix)
             /* new stream? */
             hvfs_debug(lib, "NEW STREAM\n");
             new_stream(id, suffix);
-            break;
-        }
-    } else {
-        hvfs_warning(lib, "%s", reply->str);
-    }
-    freeReplyObject(reply);
-
-    return 0;
-}
-
-int new_stream_str(struct streamid_str *id, int suffix);
-
-int addOrUpdateStreamStr(struct streamid_str *id, int suffix)
-{
-    char key[128];
-    int klen;
-    redisContext *c;
-    redisReply *reply = NULL;
-
-#define INB_STREAM_STR      STREAM_HEAD "izjs %s igjlx %s ijlsj %s ijcsj %s ibs %s"
-#define OUT_STREAM_STR      STREAM_HEAD "ozjs %s ogjlx %s ojlsj %s ojcsj %s obs %s"
-
-    /* for HUPDBY command, we accept >4 arguments */
-    GEN_HASH_KEY_STR(key, id, klen);
-    
-    c = get_server_from_key(key);
-
-    GEN_FULL_KEY(key, id, klen, suffix);
-
-    if (id->direction & STREAM_IN ||
-        id->direction & STREAM_INNIL)
-        reply = redisCommand(c, INB_STREAM_STR,
-                             key,
-                             id->direction,
-                             id->zjs, /* if id->zjs > current value, then do
-                                       * update, otherwise, do not update */
-                             id->gjlx, /* tool type is ORed */
-                             id->jlsj,
-                             id->jcsj,
-                             id->bs);
-    else if (id->direction & STREAM_OUT||
-             id->direction & STREAM_OUTNIL)
-        reply = redisCommand(c, OUT_STREAM_STR,
-                             key,
-                             id->direction,
-                             id->zjs, /* if id->zjs > current value, then do
-                                       * update, otherwise, do not update */
-                             id->gjlx, /* tool type is ORed */
-                             id->jlsj,
-                             id->jcsj,
-                             id->bs);
-    else
-        return -1;
-
-    if (unlikely(!reply)) {
-        hvfs_err(lib, "Connection corrupted, failed w/ %d\n", c->err);
-        exit(-1);
-    }
-    if (reply->type == REDIS_REPLY_INTEGER) {
-        /* the update flag */
-        switch (reply->integer) {
-        case CANCEL:
-            hvfs_debug(lib, "CANCEL record\n");
-            atomic64_inc(&canceled);
-            break;
-        case INB_INIT:
-        case OUT_INIT:
-            hvfs_debug(lib, "INIT STREAM\n");
-            break;
-        case INB_UPDATED:
-        case OUT_UPDATED:
-            hvfs_debug(lib, "UPDATE STREAM\n");
-            break;
-        case INB_CLOSED:
-        case OUT_CLOSED:
-            hvfs_debug(lib, "Half CLOSE STREAM\n");
-            break;
-        case ALL_CLOSED:
-            hvfs_debug(lib, "FULLY CLOSE STREAM\n");
-            atomic64_inc(&poped);
-            break;
-        case INB_IGNORE:
-        case OUT_IGNORE:
-            hvfs_debug(lib, "IGNORE record\n");
-            new_stream_str(id, suffix);
-            break;
-        case TIMED_IGNORE:
-            /* new stream? */
-            hvfs_debug(lib, "NEW STREAM\n");
-            new_stream_str(id, suffix);
             break;
         }
     } else {
@@ -627,15 +529,14 @@ int addOrUpdateStreamPipeline(struct streamid *id, int suffix, int flush)
         goto do_flush;
     
     GEN_HASH_KEY(key, id, klen);
-    e = get_xg_from_key(key);
+    e = get_xg_from_key(key, klen);
     GEN_FULL_KEY(key, id, klen, suffix);
 
     e->nr++;
     c = e->context;
     pp = e->private;
 
-    if (id->direction & STREAM_IN ||
-        id->direction & STREAM_INNIL) {
+    if (id->direction & (STREAM_IN | STREAM_INNIL)) {
         xlock_lock(&pp->lock);
         redisAppendCommand(c, INB_STREAM,
                            key,
@@ -648,8 +549,7 @@ int addOrUpdateStreamPipeline(struct streamid *id, int suffix, int flush)
                            id->jcsj,
                            id->bs);
         xlock_unlock(&pp->lock);
-    } else if (id->direction & STREAM_OUT||
-             id->direction & STREAM_OUTNIL) {
+    } else if (id->direction & (STREAM_OUT | STREAM_OUTNIL)) {
         xlock_lock(&pp->lock);
         redisAppendCommand(c, OUT_STREAM,
                            key,
@@ -672,7 +572,7 @@ int addOrUpdateStreamPipeline(struct streamid *id, int suffix, int flush)
     pp->pnr++;
     pnr++;
 
-    if (pnr >= g_pnr) {
+    if (unlikely(pnr >= g_pnr)) {
         /* ok, we should get the reply */
         void *tmp;
         int i, j, err;
@@ -838,26 +738,6 @@ int new_stream(struct streamid *id, int suffix)
     return addOrUpdateStream(id, suffix);
 }
 
-int new_stream_str(struct streamid_str *id, int suffix)
-{
-    char str[128];
-    int klen;
-    
-    suffix += 1;
-
-    GEN_HASH_KEY_STR(str, id, klen);
-    GEN_FULL_KEY(str, id, klen, suffix);
-    hvfs_debug(lib, "New -> %s\n", str);
-    
-    /* try next stream until 1000 */
-    if (suffix >= 10000) {
-        return EINVAL;
-    }
-    newstream_nr++;
-
-    return addOrUpdateStreamStr(id, suffix);
-}
-
 /* rename suffix + 1 to suffix until there is no (suffix + 1) key */
 int rename_stream(struct streamid *id, int suffix)
 {
@@ -869,7 +749,7 @@ int rename_stream(struct streamid *id, int suffix)
     GEN_HASH_KEY(from_key, id, klen1);
     GEN_HASH_KEY(to_key, id, klen2);
 
-    c = get_server_from_key(from_key);
+    c = get_server_from_key(from_key, klen1);
 
     GEN_FULL_KEY(from_key, id, klen1, suffix + 1);
     GEN_FULL_KEY(to_key, id, klen2, suffix);
@@ -906,7 +786,7 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
 
     GEN_HASH_KEY(key, id, klen);
 
-    c = get_server_from_key(key);
+    c = get_server_from_key(key, klen);
 
     GEN_FULL_KEY(key, id, klen, suffix);
 
@@ -924,9 +804,9 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
             hvfs_debug(lib, "%s = %s\n", 
                        reply->element[j]->str, reply->element[j + 1]->str);
 
-            if (strcmp(reply->element[j]->str, "DON") == 0) {
+            if (strcmp(reply->element[j]->str, "D") == 0) {
                 stat->DON = atoi(reply->element[j + 1]->str);
-            } else if (strcmp(reply->element[j]->str, "igjlx") == 0) {
+            } else if (strcmp(reply->element[j]->str, "ig") == 0) {
                 stat->ogjlx = atoi(reply->element[j + 1]->str);
             } else if (strcmp(reply->element[j]->str, "ijlsj") == 0) {
                 stat->ijlsj = strtoul(reply->element[j + 1]->str, NULL, 10);
@@ -936,11 +816,11 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
                 stat->ijcsj = strtoul(reply->element[j + 1]->str, NULL, 10);
             } else if (strcmp(reply->element[j]->str, "ijcks") == 0) {
                 stat->ijcks = strtoul(reply->element[j + 1]->str, NULL, 10);
-            } else if (strcmp(reply->element[j]->str, "izjs") == 0) {
+            } else if (strcmp(reply->element[j]->str, "iz") == 0) {
                 stat->izjs = strtoul(reply->element[j + 1]->str, NULL, 10);
-            } else if (strcmp(reply->element[j]->str, "ibs") == 0) {
+            } else if (strcmp(reply->element[j]->str, "ib") == 0) {
                 stat->ibs = atoi(reply->element[j + 1]->str);
-            } else if (strcmp(reply->element[j]->str, "ogjlx") == 0) {
+            } else if (strcmp(reply->element[j]->str, "og") == 0) {
                 stat->ogjlx = atoi(reply->element[j + 1]->str);
             } else if (strcmp(reply->element[j]->str, "ojlsj") == 0) {
                 stat->ojlsj = strtoul(reply->element[j + 1]->str, NULL, 10);
@@ -950,9 +830,9 @@ int getStreamStat(struct streamid *id, int suffix, struct streamstat *stat, int 
                 stat->ojcsj = strtoul(reply->element[j + 1]->str, NULL, 10);
             } else if (strcmp(reply->element[j]->str, "ojcks") == 0) {
                 stat->ojcks = strtoul(reply->element[j + 1]->str, NULL, 10);
-            } else if (strcmp(reply->element[j]->str, "ozjs") == 0) {
+            } else if (strcmp(reply->element[j]->str, "oz") == 0) {
                 stat->ozjs = strtoul(reply->element[j + 1]->str, NULL, 10);
-            } else if (strcmp(reply->element[j]->str, "obs") == 0) {
+            } else if (strcmp(reply->element[j]->str, "ob") == 0) {
                 stat->obs = atoi(reply->element[j + 1]->str);
             }
         }
@@ -1010,8 +890,7 @@ void generate_huadan(struct streamid *id, struct streamstat *stat, struct huadan
     hd->jssj = max(stat->ijlsj, stat->ojlsj);
 
     /* dural time computing */
-    if (stat->DON & STREAM_INNIL ||
-        stat->DON & STREAM_OUTNIL) {
+    if (stat->DON & (STREAM_INNIL | STREAM_OUTNIL)) {
         /* have detect a NIL packet, based on jcsj */
         if (stat->ijcks == 0)
             begin = stat->ojcks;
@@ -1640,7 +1519,7 @@ int process_table(void *data, int cnt, const char **cv)
     if (unlikely(cnt < m->cnr_accept)) {
         /* ignore this line */
         corrupt_nr++;
-        goto update_pos;
+        return 0;
     }
 
     memset(&id, 0, sizeof(id));
@@ -1655,18 +1534,28 @@ int process_table(void *data, int cnt, const char **cv)
         /* parse the string */
         p = (char *)cv[LYLX_SHIFT(9)];
         do {
-            q = strtok(p, ";,\n");
+            q = strtok(p, ";,");
             if (!q) {
                 break;
-            } else if (strcmp(q, "INB") == 0) {
-                id.direction = STREAM_IN;
-            } else if (strcmp(q, "OUT") == 0) {
-                id.direction = STREAM_OUT;
-            } else if (strcmp(q, "UDA") == 0) {
-                id.protocol = STREAM_UDP;
-            } else if (strcmp(q, "TDA") == 0) {
-                id.protocol = STREAM_TCP;
-            } else if (strcmp(q, "NIL") == 0) {
+            } 
+
+            if (unlikely(!id.direction)) {
+                if (strcmp(q, "INB") == 0) {
+                    id.direction = STREAM_IN;
+                } else if (strcmp(q, "OUT") == 0) {
+                    id.direction = STREAM_OUT;
+                }
+            }
+            
+            if (unlikely(!id.protocol)) {
+                if (strcmp(q, "UDA") == 0) {
+                    id.protocol = STREAM_UDP;
+                } else if (strcmp(q, "TDA") == 0) {
+                    id.protocol = STREAM_TCP;
+                }
+            }
+
+            if (strcmp(q, "NIL") == 0) {
                 /* this is the stream end flag, we should POP the
                  * six-entry tuple from db[0] to db[1] */
                 EOS = 1;
@@ -1683,23 +1572,23 @@ int process_table(void *data, int cnt, const char **cv)
 
     if (EOS) {
         id.direction = (id.direction << 2) & 0xf;
-        if (!id.direction || !id.protocol) {
+        if (!id.protocol || !id.direction) {
             /* invalid direction, ignore it */
             ignore_nr++;
-            goto update_pos;
+            return 0;
         }
     } else {
         if (unlikely(g_sc.ignoreact)) {
             if (!id.direction || !id.protocol) {
                 /* invalid direction, ignore it */
                 ignore_nr++;
-                goto update_pos;
+                return 0;
             }
         } else {
             if (!id.direction || !id.protocol || !(isact && !isfrg)) {
                 /* invalid direction, ignore it */
                 ignore_nr++;
-                goto update_pos;
+                return 0;
             }
         }
     }
@@ -1709,97 +1598,21 @@ int process_table(void *data, int cnt, const char **cv)
         hvfs_debug(lib, " => %s\n", p); free(p);
     }
 
-    if (g_pipeline)
+    if (g_pipeline) {
+        lib_timer_B();
         addOrUpdateStreamPipeline(&id, 0, 0);
-    else
-        addOrUpdateStream(&id, 0);
-    process_nr++;
-
-    /* update the current valid stream offset */
-update_pos:
-
-    return 0;
-}
-
-int process_table_bystr(void *data, int cnt, const char **cv)
-{
-    struct manager *m = (struct manager *)data;
-    struct streamid_str id;
-    char *p, *q;
-    int EOS = 0, isact = 0, isfrg = 0;
-
-    if (unlikely(cnt < m->cnr_accept)) {
-        /* ignore this line */
-        corrupt_nr++;
-        goto update_pos;
-    }
-
-    memset(&id, 0, sizeof(id));
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(1), jlsj, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(2), jcsj, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(3), cljip, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(5), fwqip, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(6), fwqdk, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(7), khdip, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(8), khddk, cv);
-    {
-        /* parse the string */
-        p = (char *)cv[LYLX_SHIFT(9)];
-        do {
-            q = strtok(p, ";,\n");
-            if (!q) {
-                break;
-            } else if (strcmp(q, "INB") == 0) {
-                id.direction = STREAM_IN;
-            } else if (strcmp(q, "OUT") == 0) {
-                id.direction = STREAM_OUT;
-            } else if (strcmp(q, "UDA") == 0) {
-                id.protocol = STREAM_UDP;
-            } else if (strcmp(q, "TDA") == 0) {
-                id.protocol = STREAM_TCP;
-            } else if (strcmp(q, "NIL") == 0) {
-                /* this is the stream end flag, we should POP the
-                 * six-entry tuple from db[0] to db[1] */
-                EOS = 1;
-            } else if (strcmp(q, "ACT") == 0) {
-                isact = 1;
-            } else if (strcmp(q, "FRG") == 0) {
-                isfrg = 1;
-            }
-        } while (p = NULL, 1);
-    }
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(10), bs, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(11), zjs, cv);
-    UPDATE_FIELD_STR(id, LYLX_SHIFT(12), gjlx, cv);
-
-    if (EOS) {
-        id.direction = (id.direction << 2) & 0xf;
-        if (!id.direction || !id.protocol) {
-            /* invalid direction, ignore it */
-            ignore_nr++;
-            goto update_pos;
-        }
+        lib_timer_E();
+        lib_timer_A(&ACC);
     } else {
-        if (unlikely(g_sc.ignoreact)) {
-            if (!id.direction || !id.protocol) {
-                /* invalid direction, ignore it */
-                ignore_nr++;
-                goto update_pos;
-            }
-        } else {
-            if (!id.direction || !id.protocol || !(isact && !isfrg)) {
-                /* invalid direction, ignore it */
-                ignore_nr++;
-                goto update_pos;
-            }
-        }
+        lib_timer_B();
+        addOrUpdateStream(&id, 0);
+        lib_timer_E();
+        lib_timer_A(&ACC);
     }
-
-    addOrUpdateStreamStr(&id, 0);
     process_nr++;
-
-    /* update the current valid stream offset */
-update_pos:
+    if (process_nr % 100000 == 99999) {
+        hvfs_info(lib, "LATENCY %.2f us\n", ACC / process_nr);
+    }
 
     return 0;
 }
@@ -1874,7 +1687,8 @@ int parse_csv_file_byfd(char *filepath, long offset)
 
     g_dfd = fd;
     
-    switch (csv_parse_fast(fd, process_table, &m, 150)) {
+    /* default as 128KB */
+    switch (csv_parse_fast(fd, g_fast_bsize, process_table, &m, 150)) {
     case E_LINE_TOO_WIDE:
         hvfs_err(lib, "Error parsing csv: line too wide.\n");
         break;
@@ -2310,7 +2124,7 @@ int main(int argc, char *argv[]) {
     int err = 0, is_fork = 0, i, db = 3, mode = 0;
 
     struct timeval timeout = { 20, 500000 }; // 20.5 seconds
-    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:MFp::";
+    char *shortflags = "c:b:A:d:r:a:s:i:o:x:fh?lgvD:I:m:MF::p::";
     struct option longflags[] = {
         {"id", required_argument, 0, 'd'},
         {"round", required_argument, 0, 'r'},
@@ -2327,7 +2141,7 @@ int main(int argc, char *argv[]) {
         {"mode", required_argument, 0, 'm'},
         {"pipeline", optional_argument, 0, 'p'},
         {"multithread", no_argument, 0, 'M'},
-        {"byfd", no_argument, 0, 'F'},
+        {"byfd", optional_argument, 0, 'F'},
         {"isfork", no_argument, 0, 'f'},
         {"local", no_argument, 0, 'l'},
         {"debug", no_argument, 0, 'g'},
@@ -2453,6 +2267,8 @@ int main(int argc, char *argv[]) {
             break;
         case 'F':
             g_parse_byfd = 1;
+            if (optarg)
+                g_fast_bsize = atoi(optarg);
             break;
         case 'h':
         case '?':

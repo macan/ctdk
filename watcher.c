@@ -4,7 +4,7 @@
  * Ma Can <ml.macana@gmail.com> OR <macan@iie.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2013-01-16 15:31:28 macan>
+ * Time-stamp: <2013-02-20 16:42:31 macan>
  *
  */
 
@@ -1070,6 +1070,8 @@ int add_job(redisContext *c, char *pathname, long offset, struct job_info *ji)
             "-f",
             "-D", dbstr,
             "-p",
+            "-M",
+            "-F",
             NULL,
         };
         char *envp[] = {

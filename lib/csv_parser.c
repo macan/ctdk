@@ -150,9 +150,9 @@ int csv_parse_eof(FILE *fp, CSV_CB_record_handler cb, void *params)
 	return 0;
 }
 
-int csv_parse_fast(int fd, CSV_CB_record_handler cb, void *params, int linemax)
+int csv_parse_fast(int fd, int bsize, CSV_CB_record_handler cb, void *params, int linemax)
 {
-	char buff[MAX_LINE_LEN];
+	char buff[bsize];
 	struct csv_parser_data d;
     void *p, *b;
     int br, bl, bt, last_line = 0;
@@ -161,7 +161,7 @@ int csv_parse_fast(int fd, CSV_CB_record_handler cb, void *params, int linemax)
 	d.params   = params;
 
     p = b = buff;
-    bt = MAX_LINE_LEN;
+    bt = bsize;
 
     /* read in some data */
 readin:
@@ -181,7 +181,7 @@ readin:
     p = b;
 
     /* handle to parse line */
-    while (MAX_LINE_LEN - (p - b) > linemax || last_line) {
+    while (bsize - (p - b) > linemax || last_line) {
         int r;
 
         d.buff = p;
@@ -195,10 +195,10 @@ readin:
     }
 
     /* we should memmove the remain buffer */
-    bl = (MAX_LINE_LEN - (p - b));
+    bl = (bsize - (p - b));
     memmove(b, p, bl);
     p = b + bl;
-    bt = MAX_LINE_LEN - bl;
+    bt = bsize - bl;
     if (!last_line)
         goto readin;
 

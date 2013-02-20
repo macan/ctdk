@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-11 16:04:24 macan>
+ * Time-stamp: <2013-01-25 09:43:30 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -80,7 +80,7 @@ int ring_add_point(struct chp *p, struct chring *r);
 int ring_add_point_nosort(struct chp *p, struct chring *r);
 
 /* Get the point in the ring */
-struct chp *ring_get_point(char *key, struct chring *r);
+struct chp *ring_get_point(char *key, int klen, struct chring *r);
 struct chp *ring_get_point2(u64 point, struct chring *r);
 
 /* Dump the consistent hash ring */

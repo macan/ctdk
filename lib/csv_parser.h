@@ -37,6 +37,6 @@ typedef int (*CSV_CB_record_handler)
 
 int csv_parse (FILE *fp, CSV_CB_record_handler cb, void *params);
 int csv_parse_eof (FILE *fp, CSV_CB_record_handler cb, void *params);
-int csv_parse_fast(int fd, CSV_CB_record_handler cb, void *params, int linemax);
+int csv_parse_fast(int fd, int bsize, CSV_CB_record_handler cb, void *params, int linemax);
 
 #endif

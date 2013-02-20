@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2013-01-17 09:29:23 macan>
+ * Time-stamp: <2013-01-31 14:15:39 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -120,5 +120,18 @@ __attribute__((unused)) = {"",
 
 void lib_backtrace(void);
 void lib_segv(int, siginfo_t *, void *);
+
+/* APIs */
+void lib_timer_start(struct timeval *begin);
+void lib_timer_stop(struct timeval *end);
+void lib_timer_echo(struct timeval *begin, struct timeval *end, int loop);
+void lib_timer_acc(struct timeval *, struct timeval *, double *);
+void lib_timer_echo_plus(struct timeval *, struct timeval *, int, char *);
+
+#define lib_timer_def() struct timeval begin, end
+#define lib_timer_B() lib_timer_start(&begin)
+#define lib_timer_E() lib_timer_stop(&end)
+#define lib_timer_O(loop, str) lib_timer_echo_plus(&begin, &end, loop, str)
+#define lib_timer_A(ACC) lib_timer_acc(&begin, &end, (ACC))
 
 #endif

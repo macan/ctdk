@@ -3,7 +3,7 @@
  *                           <macan@ncic.ac.cn>
  *
  * Armed with EMACS.
- * Time-stamp: <2012-12-26 11:50:32 macan>
+ * Time-stamp: <2013-01-25 09:41:34 macan>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -247,9 +247,9 @@ struct chp *ring_get_point2(u64 point, struct chring *r)
     return __ring_get_point2(point, r);
 }
 
-struct chp *ring_get_point(char *key, struct chring *r)
+struct chp *ring_get_point(char *key, int klen, struct chring *r)
 {
-    return __ring_get_point2_nolock(hvfs_hash(key, strlen(key)), r);
+    return __ring_get_point2_nolock(hvfs_hash(key, klen), r);
 }
 
 /* ABI: we assume that the rr array has at least topn slots
